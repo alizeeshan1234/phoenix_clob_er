@@ -1,11 +1,22 @@
 pub mod cancel_multiple_orders;
+pub mod close_deposit_receipt;
+pub mod commit_and_undelegate_market;
+pub mod commit_market;
+pub mod delegate_market;
+pub mod delegate_seat;
 pub mod deposit;
+pub mod execute_withdrawal_base_chain;
 pub mod fees;
 pub mod governance;
 pub mod initialize;
 pub mod manage_seat;
 pub mod new_order;
+pub mod process_deposit_er;
+pub mod process_withdrawal_er;
 pub mod reduce_order;
+pub mod request_deposit;
+pub mod request_withdrawal;
+pub mod undelegate_market;
 pub mod withdraw;
 
 pub use cancel_multiple_orders::*;

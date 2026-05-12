@@ -273,6 +273,146 @@ pub enum PhoenixInstruction {
     #[account(3, signer, name = "market_authority", desc = "The market_authority account must sign to change the free recipient")]
     #[account(4, name = "new_fee_recipient", desc = "New fee recipient")]
     ChangeFeeRecipient = 109,
+
+    // MagicBlock Ephemeral Rollup integration. These ixs do NOT follow
+    // Phoenix's standard "first 4 accounts are [program, log_authority,
+    // market, signer]" convention; they're dispatched separately in
+    // `process_instruction`.
+
+    /// Delegate the market PDA to the MagicBlock delegation program so it
+    /// can be mutated on an Ephemeral Rollup. Base-layer-only.
+    #[account(0, writable, signer, name = "authority", desc = "Market authority, payer for delegation buffer")]
+    #[account(1, name = "system_program", desc = "System program")]
+    #[account(2, writable, name = "market", desc = "Market PDA to delegate")]
+    #[account(3, name = "owner_program", desc = "Phoenix program (= current owner of the market)")]
+    #[account(4, writable, name = "delegation_buffer", desc = "Buffer PDA used during delegation, seeds [b'buffer', market]")]
+    #[account(5, writable, name = "delegation_record", desc = "Delegation record account (owned by delegation program)")]
+    #[account(6, writable, name = "delegation_metadata", desc = "Delegation metadata account (owned by delegation program)")]
+    #[account(7, name = "delegation_program", desc = "MagicBlock delegation program")]
+    DelegateMarket = 200,
+
+    /// Snapshot the delegated market's state back to the base layer; the
+    /// market stays delegated. ER-only.
+    #[account(0, writable, signer, name = "payer", desc = "Pays for the commit")]
+    #[account(1, writable, name = "market", desc = "Delegated market PDA")]
+    #[account(2, name = "magic_program", desc = "MagicBlock program (Magic111...)")]
+    #[account(3, writable, name = "magic_context", desc = "MagicBlock context (MagicContext1...)")]
+    CommitMarket = 201,
+
+    /// Snapshot final state AND queue undelegation. After this lands on the
+    /// ER, the delegation program will call back into Phoenix on the base
+    /// layer with the `EXTERNAL_UNDELEGATE_DISCRIMINATOR` to finalize
+    /// ownership transfer. ER-only.
+    #[account(0, writable, signer, name = "payer", desc = "Pays for the commit")]
+    #[account(1, writable, name = "market", desc = "Delegated market PDA")]
+    #[account(2, name = "magic_program", desc = "MagicBlock program (Magic111...)")]
+    #[account(3, writable, name = "magic_context", desc = "MagicBlock context (MagicContext1...)")]
+    CommitAndUndelegateMarket = 202,
+
+    /// Delegate a Seat PDA to the MagicBlock delegation program so trading
+    /// instructions that require seat validation (PlaceLimitOrder*,
+    /// SwapWithFreeFunds, PlaceMultiplePostOnly*) can run on the ER.
+    /// Base-layer-only.
+    #[account(0, writable, signer, name = "authority", desc = "Market authority, payer for delegation buffer")]
+    #[account(1, name = "system_program", desc = "System program")]
+    #[account(2, name = "market", desc = "Market this seat belongs to (read-only here)")]
+    #[account(3, writable, name = "seat", desc = "Seat PDA to delegate, seeds [b'seat', market, trader]")]
+    #[account(4, name = "trader", desc = "Trader pubkey (read-only) used to derive the seat PDA")]
+    #[account(5, name = "owner_program", desc = "Phoenix program (= current owner of the seat)")]
+    #[account(6, writable, name = "delegation_buffer", desc = "Buffer PDA used during delegation, seeds [b'buffer', seat]")]
+    #[account(7, writable, name = "delegation_record", desc = "Delegation record account (owned by delegation program)")]
+    #[account(8, writable, name = "delegation_metadata", desc = "Delegation metadata account (owned by delegation program)")]
+    #[account(9, name = "delegation_program", desc = "MagicBlock delegation program")]
+    DelegateSeat = 203,
+
+    /// Receipt-PDA deposit, step 1 of 3 (base layer, user-signed).
+    /// SPL transfer wallet -> vault, create DepositReceipt PDA, delegate
+    /// receipt to ER. Used when the market is already delegated.
+    #[account(0, writable, signer, name = "trader", desc = "Trader (signer, payer)")]
+    #[account(1, name = "system_program", desc = "System program")]
+    #[account(2, writable, name = "market", desc = "Delegated market (read-only data, used to validate vault/mint)")]
+    #[account(3, writable, name = "base_account", desc = "Trader base token account (SPL source)")]
+    #[account(4, writable, name = "quote_account", desc = "Trader quote token account (SPL source)")]
+    #[account(5, writable, name = "base_vault", desc = "Market base vault (SPL destination)")]
+    #[account(6, writable, name = "quote_vault", desc = "Market quote vault (SPL destination)")]
+    #[account(7, name = "token_program", desc = "SPL Token program")]
+    #[account(8, writable, name = "receipt", desc = "DepositReceipt PDA (empty, will be created)")]
+    #[account(9, name = "owner_program", desc = "Phoenix program (= future owner of the receipt)")]
+    #[account(10, writable, name = "delegation_buffer", desc = "Buffer PDA for delegation")]
+    #[account(11, writable, name = "delegation_record", desc = "Delegation record account")]
+    #[account(12, writable, name = "delegation_metadata", desc = "Delegation metadata account")]
+    #[account(13, name = "delegation_program", desc = "MagicBlock delegation program")]
+    RequestDeposit = 204,
+
+    /// Receipt-PDA deposit, step 2 of 3 (ER, validator- or keeper-signed).
+    /// Reads the delegated receipt, credits the trader's TraderState inside
+    /// the delegated market, marks receipt processed, and CPIs
+    /// commit_and_undelegate so the receipt returns to base layer.
+    #[account(0, writable, signer, name = "payer", desc = "Pays for the commit; not necessarily the trader")]
+    #[account(1, writable, name = "market", desc = "Delegated market")]
+    #[account(2, writable, name = "receipt", desc = "Delegated DepositReceipt PDA")]
+    #[account(3, name = "magic_program", desc = "MagicBlock program (Magic111...)")]
+    #[account(4, writable, name = "magic_context", desc = "MagicBlock context")]
+    ProcessDepositEr = 205,
+
+    /// Receipt-PDA deposit, step 3 of 3 (base layer, auto-fired post-undelegate).
+    /// Closes a processed deposit receipt and refunds rent to the trader.
+    /// Trader is not a signer; pubkey is verified against receipt.trader.
+    #[account(0, writable, name = "trader", desc = "Trader (lamport destination)")]
+    #[account(1, writable, name = "receipt", desc = "Processed DepositReceipt PDA")]
+    CloseDepositReceipt = 206,
+
+    /// Receipt-PDA withdrawal, step 1 of 3 (base layer, user-signed).
+    /// Creates the WithdrawalReceipt PDA, delegates it with a
+    /// post-delegation action that auto-fires `ProcessWithdrawalEr` on
+    /// the ER. The vault/user-token accounts are forwarded into both
+    /// the post-delegation action and the eventual post-undelegate
+    /// `ExecuteWithdrawalBaseChain` settlement so the SPL transfer at
+    /// step 3 has everything it needs.
+    #[account(0, writable, signer, name = "trader", desc = "Trader (signer, payer)")]
+    #[account(1, name = "system_program", desc = "System program")]
+    #[account(2, writable, name = "receipt", desc = "WithdrawalReceipt PDA (empty, will be created)")]
+    #[account(3, name = "market", desc = "Market (read-only; identifies the receipt)")]
+    #[account(4, writable, name = "base_account", desc = "Trader base token account (forwarded to step 3)")]
+    #[account(5, writable, name = "quote_account", desc = "Trader quote token account (forwarded to step 3)")]
+    #[account(6, writable, name = "base_vault", desc = "Market base vault (forwarded to step 3)")]
+    #[account(7, writable, name = "quote_vault", desc = "Market quote vault (forwarded to step 3)")]
+    #[account(8, name = "token_program", desc = "SPL Token program (forwarded to step 3)")]
+    #[account(9, name = "owner_program", desc = "Phoenix program")]
+    #[account(10, writable, name = "delegation_buffer", desc = "Buffer PDA for delegation")]
+    #[account(11, writable, name = "delegation_record", desc = "Delegation record account")]
+    #[account(12, writable, name = "delegation_metadata", desc = "Delegation metadata account")]
+    #[account(13, name = "delegation_program", desc = "MagicBlock delegation program")]
+    #[account(14, name = "magic_program", desc = "MagicBlock program (Magic111...)")]
+    #[account(15, writable, name = "magic_context", desc = "MagicBlock context (forwarded into action)")]
+    RequestWithdrawal = 207,
+
+    /// Receipt-PDA withdrawal, step 2 of 3 (ER, auto-fired by
+    /// post-delegation action).
+    #[account(0, writable, signer, name = "trader", desc = "Trader (signer via escrow chain)")]
+    #[account(1, writable, name = "market", desc = "Delegated market")]
+    #[account(2, writable, name = "receipt", desc = "Delegated WithdrawalReceipt PDA")]
+    #[account(3, name = "magic_program", desc = "MagicBlock program (Magic111...)")]
+    #[account(4, writable, name = "magic_context", desc = "MagicBlock context")]
+    #[account(5, writable, name = "base_account", desc = "Trader base token account (forwarded to step 3)")]
+    #[account(6, writable, name = "quote_account", desc = "Trader quote token account (forwarded to step 3)")]
+    #[account(7, writable, name = "base_vault", desc = "Market base vault (forwarded to step 3)")]
+    #[account(8, writable, name = "quote_vault", desc = "Market quote vault (forwarded to step 3)")]
+    #[account(9, name = "token_program", desc = "SPL Token program (forwarded to step 3)")]
+    ProcessWithdrawalEr = 208,
+
+    /// Receipt-PDA withdrawal, step 3 of 3 (base layer, auto-fired post-undelegate).
+    /// Verifies receipt is processed, SPL transfers vault → user_ata for
+    /// the debited amounts, closes the receipt. Trader is NOT a signer.
+    #[account(0, writable, name = "trader", desc = "Trader (lamport destination)")]
+    #[account(1, name = "market", desc = "Market (read-only; provides mint + vault keys)")]
+    #[account(2, writable, name = "base_account", desc = "Trader base token account (SPL destination)")]
+    #[account(3, writable, name = "quote_account", desc = "Trader quote token account (SPL destination)")]
+    #[account(4, writable, name = "base_vault", desc = "Market base vault (SPL source)")]
+    #[account(5, writable, name = "quote_vault", desc = "Market quote vault (SPL source)")]
+    #[account(6, name = "token_program", desc = "SPL Token program")]
+    #[account(7, writable, name = "receipt", desc = "Processed WithdrawalReceipt PDA")]
+    ExecuteWithdrawalBaseChain = 209,
 }
 
 impl PhoenixInstruction {

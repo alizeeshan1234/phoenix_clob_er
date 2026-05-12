@@ -1,6 +1,10 @@
 
 target
+target-docker
+test-ledger
 **/*.rs.bk
 **/node_modules
 **/.crates
 yarn.lock
+package-lock.json
+tests-ts/.devnet-state.json

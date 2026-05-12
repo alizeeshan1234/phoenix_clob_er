@@ -36,6 +36,22 @@ pub fn get_seat_address(market: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
     Pubkey::find_program_address(&[b"seat", market.as_ref(), trader.as_ref()], &crate::ID)
 }
 
+/// PDA address for a deposit receipt: seeds `[b"deposit_receipt", market, trader]`.
+pub fn get_deposit_receipt_address(market: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"deposit_receipt", market.as_ref(), trader.as_ref()],
+        &crate::ID,
+    )
+}
+
+/// PDA address for a withdrawal receipt: seeds `[b"withdrawal_receipt", market, trader]`.
+pub fn get_withdrawal_receipt_address(market: &Pubkey, trader: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"withdrawal_receipt", market.as_ref(), trader.as_ref()],
+        &crate::ID,
+    )
+}
+
 pub(crate) struct PhoenixLogContext<'a, 'info> {
     pub(crate) phoenix_program: Program<'a, 'info>,
     pub(crate) log_authority: PDA<'a, 'info>,

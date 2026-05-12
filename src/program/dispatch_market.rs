@@ -58,6 +58,7 @@ pub(crate) fn dispatch_market_mut<'a>(
         num_seats,
     } = market_size_params;
     let market = match (bids_size, asks_size, num_seats) {
+        (8, 8, 4) => fifo_market_mut!(8, 8, 4, bytes),
         (512, 512, 128) => fifo_market_mut!(512, 512, 128, bytes),
         (512, 512, 1025) => fifo_market_mut!(512, 512, 1025, bytes),
         (512, 512, 1153) => fifo_market_mut!(512, 512, 1153, bytes),
@@ -107,6 +108,7 @@ fn dispatch_market<'a>(
         market_size_params.asks_size,
         market_size_params.num_seats,
     ) {
+        (8, 8, 4) => fifo_market!(8, 8, 4, bytes),
         (512, 512, 128) => fifo_market!(512, 512, 128, bytes),
         (512, 512, 1025) => fifo_market!(512, 512, 1025, bytes),
         (512, 512, 1153) => fifo_market!(512, 512, 1153, bytes),
@@ -139,6 +141,7 @@ pub fn get_market_size(market_size_params: &MarketSizeParams) -> Result<usize, P
         num_seats,
     } = market_size_params;
     let size = match (bids_size, asks_size, num_seats) {
+        (8, 8, 4) => fifo_market_size!(8, 8, 4),
         (512, 512, 128) => fifo_market_size!(512, 512, 128),
         (512, 512, 1025) => fifo_market_size!(512, 512, 1025),
         (512, 512, 1153) => fifo_market_size!(512, 512, 1153),

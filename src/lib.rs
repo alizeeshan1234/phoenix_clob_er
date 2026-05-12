@@ -23,9 +23,7 @@ pub mod state;
 use crate::program::processor::*;
 
 use borsh::BorshSerialize;
-// You need to import Pubkey prior to using the declare_id macro
-use ellipsis_macros::declare_id;
-use solana_program::{program::set_return_data, pubkey::Pubkey};
+use solana_program::{declare_id, program::set_return_data, pubkey::Pubkey};
 
 use program::{
     assert_with_msg, event_recorder::EventRecorder, PhoenixInstruction, PhoenixLogContext,
@@ -54,36 +52,30 @@ security_txt! {
     auditors: "contact@osec.io"
 }
 
-declare_id!("PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY");
+declare_id!("AwCrmRz5wSst99eYA7to6vtqCQ7QmCkxV29gVFxwMUXb");
 
-/// This is a static PDA with seeds: [b"log"]
-/// If the program id changes, this will also need to be updated
+/// Static PDA with seeds `[b"log"]`. Used by the program's self-CPI event
+/// recorder so client indexers can parse inner-instruction data without
+/// trusting the caller.
+///
+/// If the program id changes, this address (and its bump) must be
+/// recomputed. The compile-time `declare_pda!` from ellipsis-macros (1.14
+/// era) is replaced here by an inline `pubkey!` constant for the address
+/// and a runtime `find_program_address` for the bump.
 pub mod phoenix_log_authority {
-    // You need to import Pubkey prior to using the declare_pda macro
-    use ellipsis_macros::declare_pda;
     use solana_program::pubkey::Pubkey;
 
-    // This creates a static PDA with seeds: [b"log"]
-    // The address of the PDA is 7aDTsspkQNGKmrexAN7FLx9oxU3iPczSSvHNggyuqYkR
-    // The bump seed is stored in a variable called bump()
-    declare_pda!(
-        "7aDTsspkQNGKmrexAN7FLx9oxU3iPczSSvHNggyuqYkR",
-        "PhoeNiXZ8ByJGLkxNfZRnkUfjvmuYqLR89jjFHGqdXY",
-        "log"
-    );
+    /// PDA address — `find_program_address(&[b"log"], &phoenix_id())`.
+    /// Computed at runtime so it tracks the deployed program ID.
+    #[inline]
+    pub fn id() -> Pubkey {
+        Pubkey::find_program_address(&[b"log"], &super::id()).0
+    }
 
-    #[test]
-    fn check_pda() {
-        use crate::phoenix_log_authority;
-        use solana_program::pubkey::Pubkey;
-        assert_eq!(
-            phoenix_log_authority::ID,
-            Pubkey::create_program_address(
-                &["log".as_ref(), &[phoenix_log_authority::bump()]],
-                &super::id()
-            )
-            .unwrap()
-        );
+    /// Bump seed for the log authority PDA.
+    #[inline]
+    pub fn bump() -> u8 {
+        Pubkey::find_program_address(&[b"log"], &super::id()).1
     }
 }
 
@@ -95,12 +87,97 @@ pub fn process_instruction(
     accounts: &[AccountInfo],
     instruction_data: &[u8],
 ) -> ProgramResult {
+    // The MagicBlock delegation program calls back into Phoenix with an
+    // 8-byte discriminator after a commit-and-undelegate completes. Tail of
+    // the instruction data is a borsh-serialized `Vec<Vec<u8>>` of PDA seeds.
+    // Handle this before single-byte instruction dispatch.
+    if instruction_data.len() >= 8
+        && instruction_data[..8] == ephemeral_rollups_sdk::consts::EXTERNAL_UNDELEGATE_DISCRIMINATOR
+    {
+        let account_seeds: Vec<Vec<u8>> =
+            borsh::BorshDeserialize::try_from_slice(&instruction_data[8..])
+                .map_err(|_| ProgramError::InvalidInstructionData)?;
+        return crate::program::processor::undelegate_market::process_undelegate_market_with_seeds(
+            program_id,
+            accounts,
+            account_seeds,
+        );
+    }
+
     let (tag, data) = instruction_data
         .split_first()
         .ok_or(ProgramError::InvalidInstructionData)?;
 
     let instruction =
         PhoenixInstruction::try_from(*tag).or(Err(ProgramError::InvalidInstructionData))?;
+
+    // MagicBlock Ephemeral Rollup integration. These ixs do NOT follow the
+    // standard `[phoenix_program, log_authority, market, signer]` first-4
+    // convention used by Phoenix's matching/governance ixs, so dispatch
+    // them before the `split_at(4)` and context loading below.
+    match instruction {
+        PhoenixInstruction::DelegateMarket => {
+            phoenix_log!("PhoenixInstruction::DelegateMarket");
+            return crate::program::processor::delegate_market::process_delegate_market(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::CommitMarket => {
+            phoenix_log!("PhoenixInstruction::CommitMarket");
+            return crate::program::processor::commit_market::process_commit_market(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::CommitAndUndelegateMarket => {
+            phoenix_log!("PhoenixInstruction::CommitAndUndelegateMarket");
+            return crate::program::processor::commit_and_undelegate_market::process_commit_and_undelegate_market(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::DelegateSeat => {
+            phoenix_log!("PhoenixInstruction::DelegateSeat");
+            return crate::program::processor::delegate_seat::process_delegate_seat(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::RequestDeposit => {
+            phoenix_log!("PhoenixInstruction::RequestDeposit");
+            return crate::program::processor::request_deposit::process_request_deposit(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::ProcessDepositEr => {
+            phoenix_log!("PhoenixInstruction::ProcessDepositEr");
+            return crate::program::processor::process_deposit_er::process_process_deposit_er(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::CloseDepositReceipt => {
+            phoenix_log!("PhoenixInstruction::CloseDepositReceipt");
+            return crate::program::processor::close_deposit_receipt::process_close_deposit_receipt(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::RequestWithdrawal => {
+            phoenix_log!("PhoenixInstruction::RequestWithdrawal");
+            return crate::program::processor::request_withdrawal::process_request_withdrawal(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::ProcessWithdrawalEr => {
+            phoenix_log!("PhoenixInstruction::ProcessWithdrawalEr");
+            return crate::program::processor::process_withdrawal_er::process_process_withdrawal_er(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::ExecuteWithdrawalBaseChain => {
+            phoenix_log!("PhoenixInstruction::ExecuteWithdrawalBaseChain");
+            return crate::program::processor::execute_withdrawal_base_chain::process_execute_withdrawal_base_chain(
+                program_id, accounts, data,
+            );
+        }
+        _ => {}
+    }
 
     // This is a special instruction that is only used for recording
     // inner instruction data from recursive CPI calls.
@@ -128,6 +205,16 @@ pub fn process_instruction(
     let accounts_iter = &mut program_accounts.iter();
     let phoenix_log_context = PhoenixLogContext::load(accounts_iter)?;
     let market_context = if instruction == PhoenixInstruction::InitializeMarket {
+        // If the market account is still system-owned (uninit), allocate it
+        // as a PDA before anything reads the header. No-op when the caller
+        // pre-allocated the account (legacy keypair flow).
+        initialize::maybe_allocate_market_pda(
+            program_id,
+            &program_accounts[2], // market
+            &program_accounts[3], // market_creator
+            accounts,
+            data,
+        )?;
         PhoenixMarketContext::load_init(accounts_iter)?
     } else {
         PhoenixMarketContext::load(accounts_iter)?

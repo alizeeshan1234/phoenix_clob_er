@@ -17,6 +17,48 @@ use spl_associated_token_account::get_associated_token_address;
 use crate::program::loaders::get_vault_address;
 use crate::program::validation::loaders::get_seat_address;
 
+/// Builds a single `InitializeMarket` instruction targeting the canonical
+/// market PDA derived from `[b"market", base, quote, market_creator]`. The
+/// program allocates the market account itself via `invoke_signed`; the
+/// caller does NOT need to pre-create the market with a keypair.
+///
+/// Returns `(market_pda, instruction)`. Markets created via this builder are
+/// delegatable to the MagicBlock Ephemeral Rollup.
+#[allow(clippy::too_many_arguments)]
+pub fn create_initialize_market_instruction_pda(
+    base: &Pubkey,
+    quote: &Pubkey,
+    market_creator: &Pubkey,
+    header_params: MarketSizeParams,
+    num_quote_lots_per_quote_unit: u64,
+    num_base_lots_per_base_unit: u64,
+    tick_size_in_quote_lots_per_base_unit: u64,
+    taker_fee_bps: u16,
+    fee_collector: &Pubkey,
+    raw_base_units_per_base_unit: Option<u32>,
+) -> (Pubkey, Instruction) {
+    let (market, _bump) = crate::program::processor::initialize::find_market_address(
+        base,
+        quote,
+        market_creator,
+        &crate::id(),
+    );
+    let ix = create_initialize_market_instruction(
+        &market,
+        base,
+        quote,
+        market_creator,
+        header_params,
+        num_quote_lots_per_quote_unit,
+        num_base_lots_per_base_unit,
+        tick_size_in_quote_lots_per_base_unit,
+        taker_fee_bps,
+        fee_collector,
+        raw_base_units_per_base_unit,
+    );
+    (market, ix)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn create_initialize_market_instructions(
     market: &Pubkey,

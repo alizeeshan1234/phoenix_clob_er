@@ -72,7 +72,12 @@ pub struct MarketHeader {
     pub market_sequence_number: u64,
     pub successor: Pubkey,
     pub raw_base_units_per_base_unit: u32,
-    _padding1: u32,
+    /// PDA bump for the market account. Set when the market is allocated as
+    /// a PDA via [`MARKET_SEED_PREFIX`]; left at 0 for legacy keypair-allocated
+    /// markets. Required for MagicBlock delegation, which signs CPIs using
+    /// the market's PDA seeds.
+    pub market_bump: u8,
+    _padding1: [u8; 3],
     _padding2: [u64; 32],
 }
 impl ZeroCopy for MarketHeader {}
@@ -90,6 +95,7 @@ impl MarketHeader {
         successor: Pubkey,
         fee_recipient: Pubkey,
         raw_base_units_per_base_unit: u32,
+        market_bump: u8,
     ) -> Self {
         Self {
             discriminant: get_discriminant::<MarketHeader>().unwrap(),
@@ -105,7 +111,8 @@ impl MarketHeader {
             market_sequence_number: 0,
             successor,
             raw_base_units_per_base_unit,
-            _padding1: 0,
+            market_bump,
+            _padding1: [0; 3],
             _padding2: [0; 32],
         }
     }
@@ -156,6 +163,106 @@ impl Seat {
             market,
             trader,
             approval_status: SeatApprovalStatus::NotApproved as u64,
+            _padding: [0; 6],
+        })
+    }
+}
+
+/// Per-(market, trader) work order PDA for the MagicBlock Receipt flow.
+///
+/// Lifecycle:
+///   1. Created on base layer by `RequestDeposit` with `processed = 0`.
+///   2. Delegated to the ER by the same ix.
+///   3. On the ER, `ProcessDepositEr` validates the receipt, credits the
+///      trader's `TraderState` inside the delegated market, sets
+///      `processed = 1`, and CPIs `commit_and_undelegate` so the receipt
+///      flows back to the base layer.
+///   4. On the base layer, `CloseDepositReceipt` verifies `processed == 1`
+///      and closes the account, refunding rent to the trader.
+///
+/// Seeds: `[b"deposit_receipt", market, trader]` — only one outstanding
+/// receipt per (market, trader). A new `RequestDeposit` is rejected while
+/// an unprocessed receipt exists.
+#[derive(Debug, Clone, Copy, BorshDeserialize, BorshSerialize, Zeroable, Pod)]
+#[repr(C)]
+pub struct DepositReceipt {
+    pub discriminant: u64,
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub base_lots: u64,
+    pub quote_lots: u64,
+    pub processed: u8,
+    pub bump: u8,
+    _padding: [u8; 6],
+}
+impl ZeroCopy for DepositReceipt {}
+
+impl DepositReceipt {
+    pub fn new_init(
+        trader: Pubkey,
+        market: Pubkey,
+        base_lots: u64,
+        quote_lots: u64,
+        bump: u8,
+    ) -> Result<Self, ProgramError> {
+        Ok(Self {
+            discriminant: get_discriminant::<DepositReceipt>()?,
+            trader,
+            market,
+            base_lots,
+            quote_lots,
+            processed: 0,
+            bump,
+            _padding: [0; 6],
+        })
+    }
+}
+
+/// Per-(market, trader) work order PDA for the Withdrawal Receipt flow.
+///
+/// Lifecycle:
+///   1. Created on base layer by `RequestWithdrawal` with `processed = 0`.
+///      No SPL transfer happens yet — funds are validated on the ER.
+///   2. Delegated to the ER by the same ix.
+///   3. On the ER, `ProcessWithdrawalEr` validates `TraderState.free >=
+///      requested`, debits the lots, sets `processed = 1`, and CPIs
+///      `commit_and_undelegate` so the receipt flows back to base layer.
+///   4. On the base layer, `ExecuteWithdrawalBaseChain` verifies
+///      `processed == 1`, SPL transfers vault → user (vault PDA signs),
+///      and closes the receipt to refund rent to the trader.
+///
+/// Seeds: `[b"withdrawal_receipt", market, trader]` — one outstanding
+/// receipt per (market, trader).
+#[derive(Debug, Clone, Copy, BorshDeserialize, BorshSerialize, Zeroable, Pod)]
+#[repr(C)]
+pub struct WithdrawalReceipt {
+    pub discriminant: u64,
+    pub trader: Pubkey,
+    pub market: Pubkey,
+    pub base_lots: u64,
+    pub quote_lots: u64,
+    pub processed: u8,
+    pub bump: u8,
+    _padding: [u8; 6],
+}
+impl ZeroCopy for WithdrawalReceipt {}
+
+impl WithdrawalReceipt {
+    pub fn new_init(
+        trader: Pubkey,
+        market: Pubkey,
+        base_lots: u64,
+        quote_lots: u64,
+        bump: u8,
+    ) -> Result<Self, ProgramError> {
+        Ok(Self {
+            discriminant: get_discriminant::<WithdrawalReceipt>()?,
+            trader,
+            market,
+            base_lots,
+            quote_lots,
+            processed: 0,
+            bump,
             _padding: [0; 6],
         })
     }

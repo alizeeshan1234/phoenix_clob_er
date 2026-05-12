@@ -1,0 +1,31 @@
+{
+  "name": "phoenix-er-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Devnet E2E tests for Phoenix CLOB + MagicBlock Ephemeral Rollup integration",
+  "scripts": {
+    "test": "NODE_OPTIONS='--import tsx' yarn run mocha --timeout 1000000 tests-ts/anchor/phoenix_er.ts",
+    "test:devnet": "ANCHOR_PROVIDER_URL=https://api.devnet.solana.com NODE_OPTIONS='--import tsx' yarn run mocha --timeout 1000000 tests-ts/anchor/phoenix_er.ts",
+    "lint": "prettier 'tests-ts/**/*.ts' --check",
+    "lint:fix": "prettier 'tests-ts/**/*.ts' -w"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@magicblock-labs/ephemeral-rollups-sdk": "0.6.5",
+    "@solana/spl-token": "^0.4.14",
+    "@solana/web3.js": "^1.98.0",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^9.1.1",
+    "@types/node": "^20.12.12",
+    "chai": "^4.3.4",
+    "mocha": "^10.4.0",
+    "prettier": "^2.6.2",
+    "ts-mocha": "^10.0.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.3"
+  }
+}

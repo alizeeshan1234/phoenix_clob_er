@@ -1,3 +1,5 @@
+use ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID;
+
 use crate::program::{
     error::assert_with_msg,
     get_discriminant, get_seat_address,
@@ -26,10 +28,14 @@ impl<'a, 'info> MarketAccountInfo<'a, 'info> {
     fn _new_unchecked(
         info: &'a AccountInfo<'info>,
     ) -> Result<MarketAccountInfo<'a, 'info>, ProgramError> {
+        // Accept markets owned by Phoenix (base layer) OR by the MagicBlock
+        // delegation program (when the market is delegated to an Ephemeral
+        // Rollup). Both cases store the same on-account byte layout — the
+        // delegation program preserves data when transferring ownership.
         assert_with_msg(
-            info.owner == &crate::ID,
+            info.owner == &crate::ID || info.owner == &DELEGATION_PROGRAM_ID,
             ProgramError::IllegalOwner,
-            "Market must be owned by the Phoenix program",
+            "Market must be owned by Phoenix or the MagicBlock delegation program",
         )?;
         Ok(Self {
             info,
@@ -178,10 +184,12 @@ impl<'a, 'info> SeatAccountInfo<'a, 'info> {
         approved: bool,
     ) -> Result<SeatAccountInfo<'a, 'info>, ProgramError> {
         let (seat_address, _) = get_seat_address(market, trader);
+        // Accept Phoenix-owned (base layer) OR delegation-program-owned (ER).
+        // The seat byte layout is preserved across the delegation handoff.
         assert_with_msg(
-            info.owner == &crate::ID,
+            info.owner == &crate::ID || info.owner == &DELEGATION_PROGRAM_ID,
             ProgramError::IllegalOwner,
-            "Seat must be owned by the Phoenix program",
+            "Seat must be owned by Phoenix or the MagicBlock delegation program",
         )?;
         assert_with_msg(
             &seat_address == info.key,
@@ -235,9 +243,9 @@ impl<'a, 'info> SeatAccountInfo<'a, 'info> {
             "Market on seat does not match market in instruction",
         )?;
         assert_with_msg(
-            info.owner == &crate::ID,
+            info.owner == &crate::ID || info.owner == &DELEGATION_PROGRAM_ID,
             ProgramError::IllegalOwner,
-            "Seat must be owned by the Phoenix program",
+            "Seat must be owned by Phoenix or the MagicBlock delegation program",
         )?;
         assert_with_msg(
             &seat_address == info.key,

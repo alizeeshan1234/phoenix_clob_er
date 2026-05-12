@@ -1,6 +1,6 @@
 use crate::{
     program::{
-        dispatch_market::load_with_dispatch_init,
+        dispatch_market::{get_market_size, load_with_dispatch_init},
         error::{assert_with_msg, PhoenixError},
         loaders::{get_vault_address, InitializeMarketContext},
         system_utils::create_account,
@@ -13,10 +13,140 @@ use crate::{
 };
 use borsh::{BorshDeserialize, BorshSerialize};
 use solana_program::{
-    account_info::AccountInfo, entrypoint::ProgramResult, program::invoke,
-    program_error::ProgramError, program_pack::Pack, pubkey::Pubkey, rent::Rent, sysvar::Sysvar,
+    account_info::AccountInfo, entrypoint::ProgramResult, program::{invoke, invoke_signed},
+    program_error::ProgramError, program_pack::Pack, pubkey::Pubkey, rent::Rent,
+    system_instruction, system_program, sysvar::Sysvar,
 };
 use std::{mem::size_of, ops::DerefMut};
+
+/// PDA seed prefix for the market account. The full seed list is:
+/// `[MARKET_SEED_PREFIX, base_mint, quote_mint, market_creator]`.
+///
+/// Markets allocated as PDAs with these seeds can be delegated to the
+/// MagicBlock Ephemeral Rollup. Legacy keypair-allocated markets remain
+/// supported (they cannot be delegated).
+pub const MARKET_SEED_PREFIX: &[u8] = b"market";
+
+/// Derives the canonical market PDA for a given (base_mint, quote_mint,
+/// market_creator) triple.
+pub fn find_market_address(
+    base_mint: &Pubkey,
+    quote_mint: &Pubkey,
+    market_creator: &Pubkey,
+    program_id: &Pubkey,
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[
+            MARKET_SEED_PREFIX,
+            base_mint.as_ref(),
+            quote_mint.as_ref(),
+            market_creator.as_ref(),
+        ],
+        program_id,
+    )
+}
+
+/// Allocates the market account as a PDA when the supplied account is still
+/// system-owned (uninit). No-op when the caller pre-allocated the account
+/// themselves (legacy keypair flow).
+///
+/// Must be called in the dispatch path *before* any code reads the market
+/// header (e.g. `PhoenixMarketContext::load_init`, `EventRecorder::new`),
+/// because those expect the account to be Phoenix-owned with zero-initialized
+/// data.
+///
+/// Accounts (program_accounts[2..], accounts[..]):
+///   program_accounts[2]: market   (system-owned uninit OR Phoenix-owned)
+///   program_accounts[3]: market_creator (signer, payer)
+///   accounts[0]: base_mint
+///   accounts[1]: quote_mint
+///   accounts[2]: base_vault    (unused here)
+///   accounts[3]: quote_vault   (unused here)
+///   accounts[4]: system_program
+///   accounts[5]: token_program (unused here)
+pub(crate) fn maybe_allocate_market_pda<'a, 'info>(
+    program_id: &Pubkey,
+    market_info: &'a AccountInfo<'info>,
+    market_creator: &'a AccountInfo<'info>,
+    accounts: &'a [AccountInfo<'info>],
+    data: &[u8],
+) -> ProgramResult {
+    // Already pre-allocated and owned by Phoenix (legacy keypair flow); no-op.
+    if market_info.owner == &crate::ID {
+        return Ok(());
+    }
+
+    // Anything other than system-owned + empty is an error here.
+    assert_with_msg(
+        market_info.owner == &system_program::ID && market_info.data_is_empty(),
+        ProgramError::IllegalOwner,
+        "Market account must be system-owned + uninit for PDA allocation, or pre-allocated by Phoenix",
+    )?;
+    assert_with_msg(
+        market_creator.is_signer,
+        ProgramError::MissingRequiredSignature,
+        "market_creator must sign for market PDA allocation",
+    )?;
+
+    let ctx = InitializeMarketContext::load(accounts)?;
+    let params = InitializeParams::try_from_slice(data)?;
+
+    let (expected_market, bump) = find_market_address(
+        ctx.base_mint.as_ref().key,
+        ctx.quote_mint.as_ref().key,
+        market_creator.key,
+        program_id,
+    );
+    assert_with_msg(
+        market_info.key == &expected_market,
+        ProgramError::InvalidSeeds,
+        "Market account key does not match expected PDA",
+    )?;
+
+    let space = size_of::<MarketHeader>() + get_market_size(&params.market_size_params)?;
+    let rent = Rent::get()?;
+    let lamports = rent.minimum_balance(space);
+
+    let bump_slice: &[u8] = &[bump];
+    let base_mint_key = ctx.base_mint.as_ref().key;
+    let quote_mint_key = ctx.quote_mint.as_ref().key;
+    let signer_seeds: &[&[u8]] = &[
+        MARKET_SEED_PREFIX,
+        base_mint_key.as_ref(),
+        quote_mint_key.as_ref(),
+        market_creator.key.as_ref(),
+        bump_slice,
+    ];
+
+    // SystemProgram::create_account via CPI caps allocation at 10240 bytes
+    // (MAX_PERMITTED_DATA_INCREASE) per top-level instruction. The
+    // smallest supported Phoenix market config (8×8×4) is well under
+    // that; the standard config (512×512×128) is ~80 KB and requires
+    // the legacy keypair-allocated flow.
+    const MAX_PERMITTED_DATA_INCREASE: usize = 10_240;
+    assert_with_msg(
+        space <= MAX_PERMITTED_DATA_INCREASE,
+        ProgramError::InvalidArgument,
+        "Market size > 10240 bytes can't be PDA-allocated in one ix; use the legacy keypair flow",
+    )?;
+    invoke_signed(
+        &system_instruction::create_account(
+            market_creator.key,
+            market_info.key,
+            lamports,
+            space as u64,
+            program_id,
+        ),
+        &[
+            market_creator.clone(),
+            market_info.clone(),
+            ctx.system_program.as_ref().clone(),
+        ],
+        &[signer_seeds],
+    )?;
+
+    Ok(())
+}
 
 #[derive(BorshDeserialize, BorshSerialize)]
 pub struct InitializeParams {
@@ -220,6 +350,24 @@ pub(crate) fn process_initialize_market<'a, 'info>(
         market.set_fee(taker_fee_bps as u64);
     }
 
+    // Derive the canonical market PDA for the (base, quote, creator) triple.
+    // If the market account matches that PDA, the market was allocated by
+    // `maybe_allocate_market_pda` and is delegatable; persist its bump in
+    // the header so MagicBlock delegation CPIs can sign with the correct
+    // seeds. If the market is keypair-allocated (legacy), market_bump stays
+    // 0 and the delegation entrypoint will refuse to sign for it.
+    let (expected_market_pda, derived_bump) = find_market_address(
+        base_mint.as_ref().key,
+        quote_mint.as_ref().key,
+        market_creator.key,
+        _program_id,
+    );
+    let market_bump = if market_info.key == &expected_market_pda {
+        derived_bump
+    } else {
+        0
+    };
+
     // Populate the header data
     let mut header = market_info.get_header_mut()?;
     // All markets are initialized with a status of `PostOnly`
@@ -244,6 +392,7 @@ pub(crate) fn process_initialize_market<'a, 'info>(
         *market_creator.key,
         fee_collector,
         raw_base_units_per_base_unit.unwrap_or(1),
+        market_bump,
     );
 
     drop(header);
