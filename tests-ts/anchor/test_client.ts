@@ -69,6 +69,7 @@ export const TAG = {
   PlaceMultiplePostOnlyOrders: 16,
   PlaceMultiplePostOnlyOrdersWithFreeFunds: 17,
   InitializeMarket: 100,
+  ChangeMarketStatus: 103,
   ChangeSeatStatus: 104,
   DelegateMarket: 200,
   CommitMarket: 201,
@@ -87,6 +88,159 @@ const m = (
   isWritable = false,
   isSigner = false,
 ): AccountMeta => ({ pubkey, isSigner, isWritable });
+
+// =====================================================================
+// OrderPacket — borsh encoding for Phoenix's matching engine.
+// Mirrors src/state/order_schema/order_packet.rs.
+//   Side:               Bid=0, Ask=1
+//   SelfTradeBehavior:  Abort=0, CancelProvide=1, DecrementTake=2
+// =====================================================================
+
+export type Side = "bid" | "ask";
+export type SelfTradeBehavior = "abort" | "cancel_provide" | "decrement_take";
+
+export type OrderPacket =
+  | {
+      type: "post_only";
+      side: Side;
+      priceInTicks: bigint;
+      numBaseLots: bigint;
+      clientOrderId?: bigint;
+      rejectPostOnly?: boolean;
+      lastValidSlot?: bigint;
+      lastValidUnixTimestampInSeconds?: bigint;
+      failSilentlyOnInsufficientFunds?: boolean;
+    }
+  | {
+      type: "limit";
+      side: Side;
+      priceInTicks: bigint;
+      numBaseLots: bigint;
+      selfTradeBehavior?: SelfTradeBehavior;
+      matchLimit?: bigint;
+      clientOrderId?: bigint;
+      lastValidSlot?: bigint;
+      lastValidUnixTimestampInSeconds?: bigint;
+      failSilentlyOnInsufficientFunds?: boolean;
+    }
+  | {
+      type: "ioc";
+      side: Side;
+      priceInTicks?: bigint;
+      numBaseLots: bigint;
+      numQuoteLots: bigint;
+      minBaseLotsToFill?: bigint;
+      minQuoteLotsToFill?: bigint;
+      selfTradeBehavior?: SelfTradeBehavior;
+      matchLimit?: bigint;
+      clientOrderId?: bigint;
+      lastValidSlot?: bigint;
+      lastValidUnixTimestampInSeconds?: bigint;
+    };
+
+const u8 = (n: number) => {
+  const b = Buffer.alloc(1);
+  b.writeUInt8(n, 0);
+  return b;
+};
+const u64 = (n: bigint) => {
+  const b = Buffer.alloc(8);
+  b.writeBigUInt64LE(n, 0);
+  return b;
+};
+const u128 = (n: bigint) => {
+  const b = Buffer.alloc(16);
+  b.writeBigUInt64LE(n & 0xffffffffffffffffn, 0);
+  b.writeBigUInt64LE((n >> 64n) & 0xffffffffffffffffn, 8);
+  return b;
+};
+const bool = (v: boolean) => u8(v ? 1 : 0);
+const optU64 = (v?: bigint) =>
+  v === undefined ? u8(0) : Buffer.concat([u8(1), u64(v)]);
+
+const sideTag = (s: Side) => u8(s === "bid" ? 0 : 1);
+const stbTag = (b?: SelfTradeBehavior) => {
+  const map: Record<SelfTradeBehavior, number> = {
+    abort: 0,
+    cancel_provide: 1,
+    decrement_take: 2,
+  };
+  return u8(map[b ?? "decrement_take"]);
+};
+
+export function encodeOrderPacket(p: OrderPacket): Buffer {
+  const chunks: Buffer[] = [];
+  switch (p.type) {
+    case "post_only":
+      chunks.push(u8(0));
+      chunks.push(sideTag(p.side));
+      chunks.push(u64(p.priceInTicks));
+      chunks.push(u64(p.numBaseLots));
+      chunks.push(u128(p.clientOrderId ?? 0n));
+      chunks.push(bool(p.rejectPostOnly ?? true));
+      chunks.push(bool(true)); // use_only_deposited_funds
+      chunks.push(optU64(p.lastValidSlot));
+      chunks.push(optU64(p.lastValidUnixTimestampInSeconds));
+      chunks.push(bool(p.failSilentlyOnInsufficientFunds ?? false));
+      break;
+    case "limit":
+      chunks.push(u8(1));
+      chunks.push(sideTag(p.side));
+      chunks.push(u64(p.priceInTicks));
+      chunks.push(u64(p.numBaseLots));
+      chunks.push(stbTag(p.selfTradeBehavior));
+      chunks.push(
+        p.matchLimit === undefined
+          ? u8(0)
+          : Buffer.concat([u8(1), u64(p.matchLimit)]),
+      );
+      chunks.push(u128(p.clientOrderId ?? 0n));
+      chunks.push(bool(true));
+      chunks.push(optU64(p.lastValidSlot));
+      chunks.push(optU64(p.lastValidUnixTimestampInSeconds));
+      chunks.push(bool(p.failSilentlyOnInsufficientFunds ?? false));
+      break;
+    case "ioc":
+      chunks.push(u8(2));
+      chunks.push(sideTag(p.side));
+      chunks.push(optU64(p.priceInTicks));
+      chunks.push(u64(p.numBaseLots));
+      chunks.push(u64(p.numQuoteLots));
+      chunks.push(u64(p.minBaseLotsToFill ?? 0n));
+      chunks.push(u64(p.minQuoteLotsToFill ?? 0n));
+      chunks.push(stbTag(p.selfTradeBehavior));
+      chunks.push(
+        p.matchLimit === undefined
+          ? u8(0)
+          : Buffer.concat([u8(1), u64(p.matchLimit)]),
+      );
+      chunks.push(u128(p.clientOrderId ?? 0n));
+      chunks.push(bool(true));
+      chunks.push(optU64(p.lastValidSlot));
+      chunks.push(optU64(p.lastValidUnixTimestampInSeconds));
+      break;
+  }
+  return Buffer.concat(chunks);
+}
+
+// CancelOrderParams (borsh: side u8 + price_in_ticks u64 + order_sequence_number u64 = 17 bytes)
+export interface CancelOrderParam {
+  side: Side;
+  priceInTicks: bigint;
+  orderSequenceNumber: bigint;
+}
+
+export function encodeCancelMultipleOrdersByIdParams(
+  orders: CancelOrderParam[],
+): Buffer {
+  // Vec<T> = u32 length + items
+  const head = Buffer.alloc(4);
+  head.writeUInt32LE(orders.length, 0);
+  const items = orders.map((o) =>
+    Buffer.concat([sideTag(o.side), u64(o.priceInTicks), u64(o.orderSequenceNumber)]),
+  );
+  return Buffer.concat([head, ...items]);
+}
 
 export class TestClient {
   provider: anchor.AnchorProvider;
@@ -403,6 +557,25 @@ export class TestClient {
     return await this.provider.sendAndConfirm(new Transaction().add(ix));
   }
 
+  /** ChangeMarketStatus — admin ix. MarketStatus enum:
+   *  0=Uninitialized, 1=Active, 2=PostOnly, 3=Paused, 4=Closed, 5=Tombstoned.
+   *  Cross/IOC (Swap) requires Active; PostOnly only allows posts+reduces. */
+  async changeMarketStatus(status: number): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const data = Buffer.from([TAG.ChangeMarketStatus, status]);
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(this.admin.publicKey, false, true),
+      ],
+      data,
+    });
+    return await this.provider.sendAndConfirm(new Transaction().add(ix));
+  }
+
   async changeSeatStatus(
     trader: PublicKey,
     status: number, // 0=NotApproved, 1=Approved, 2=Retired
@@ -621,7 +794,28 @@ export class TestClient {
       skipPreflight: true,
     });
     await this.routerConnection.confirmTransaction(sig, "confirmed");
-    return sig;
+
+    // confirmTransaction returns when the tx is confirmed at block level,
+    // NOT when the program succeeded. We must explicitly fetch the tx and
+    // verify meta.err is null — otherwise silent on-chain failures slip
+    // through as test passes.
+    for (let i = 0; i < 10; i++) {
+      const tx = await this.routerConnection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx) {
+        if (tx.meta?.err) {
+          const logs = (tx.meta.logMessages ?? []).join("\n  ");
+          throw new Error(
+            `ER tx ${sig} failed on-chain: ${JSON.stringify(tx.meta.err)}\n  ${logs}`,
+          );
+        }
+        return sig;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error(`ER tx ${sig} not retrievable after confirmation`);
   }
 
   // ===================================================================
@@ -694,6 +888,108 @@ export class TestClient {
     });
     await this.connection.confirmTransaction(sig, "confirmed");
     return sig;
+  }
+
+  // ===================================================================
+  // ER trading — place / match / cancel via Magic Router
+  // ===================================================================
+
+  /** PlaceLimitOrderWithFreeFunds on the delegated market via the ER.
+   *  Matching against the opposite book (FIFO) happens inside this ix. */
+  async placeLimitOrderOnEr(packet: OrderPacket): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const [seat] = this.findSeatAddress(this.market, this.admin.publicKey);
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(this.admin.publicKey, false, true),
+        m(seat),
+      ],
+      data: Buffer.concat([
+        Buffer.from([TAG.PlaceLimitOrderWithFreeFunds]),
+        encodeOrderPacket(packet),
+      ]),
+    });
+    return await this.sendOnRouter(ix);
+  }
+
+  /** SwapWithFreeFunds — aggressive IOC cross. Same accounts as place. */
+  async swapOnEr(packet: OrderPacket): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const [seat] = this.findSeatAddress(this.market, this.admin.publicKey);
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(this.admin.publicKey, false, true),
+        m(seat),
+      ],
+      data: Buffer.concat([
+        Buffer.from([TAG.SwapWithFreeFunds]),
+        encodeOrderPacket(packet),
+      ]),
+    });
+    return await this.sendOnRouter(ix);
+  }
+
+  /** CancelMultipleOrdersByIdWithFreeFunds — surgical cancel by (side, price, sequence). */
+  async cancelMultipleOrdersByIdOnEr(
+    orders: CancelOrderParam[],
+  ): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(this.admin.publicKey, false, true),
+      ],
+      data: Buffer.concat([
+        Buffer.from([TAG.CancelMultipleOrdersByIdWithFreeFunds]),
+        encodeCancelMultipleOrdersByIdParams(orders),
+      ]),
+    });
+    return await this.sendOnRouter(ix);
+  }
+
+  /** Read the trader's TraderState from the (possibly delegated) market
+   *  account fetched from a specific connection (base or ER). */
+  async readTraderStateFromMarket(
+    conn: Connection,
+  ): Promise<{ baseFree: bigint; quoteFree: bigint; baseLocked: bigint; quoteLocked: bigint } | null> {
+    const info = await conn.getAccountInfo(this.market);
+    if (!info) return null;
+    const traderBytes = this.admin.publicKey.toBytes();
+    for (let i = 576; i < info.data.length - 32; i++) {
+      let match = true;
+      for (let j = 0; j < 32; j++) {
+        if (info.data[i + j] !== traderBytes[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        const ts = i + 32;
+        const dv = new DataView(
+          info.data.buffer,
+          info.data.byteOffset + ts,
+          96,
+        );
+        return {
+          quoteLocked: dv.getBigUint64(0, true),
+          quoteFree: dv.getBigUint64(8, true),
+          baseLocked: dv.getBigUint64(16, true),
+          baseFree: dv.getBigUint64(24, true),
+        };
+      }
+    }
+    return null;
   }
 
   /** Smoke-test: CancelAllOrdersWithFreeFunds on the ER. */

@@ -84,6 +84,12 @@ describe("phoenix-er", () => {
     console.log("  deposit funds tx:   ", sig);
   }).timeout(60_000);
 
+  it("activates the market (status: PostOnly → Active) so IOC/Swap is allowed", async () => {
+    // MarketStatus::Active = 1. Required for SwapWithFreeFunds / IOC.
+    const sig = await tc.changeMarketStatus(1);
+    console.log("  activate market tx: ", sig);
+  }).timeout(60_000);
+
   it("delegates the market to the ER", async () => {
     const sig = await tc.delegateMarket(null);
     console.log("  delegate market tx: ", sig);
@@ -106,6 +112,84 @@ describe("phoenix-er", () => {
   it("ER trading smoke test — CancelAllOrdersWithFreeFunds on delegated market", async () => {
     const sig = await tc.cancelAllOrdersOnEr();
     console.log("  ER cancelAll tx:    ", sig);
+  }).timeout(60_000);
+
+  // =====================================================================
+  // ER trading: place / match / cancel on the delegated market
+  // =====================================================================
+
+  it("places a resting ASK on the ER (PostOnly @ 100 ticks × 5 base lots)", async () => {
+    const pre = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  pre-place trader state on ER:", pre);
+
+    const sig = await tc.placeLimitOrderOnEr({
+      type: "post_only",
+      side: "ask",
+      priceInTicks: 100n,
+      numBaseLots: 5n,
+      clientOrderId: 1n,
+    });
+    console.log("  place ASK tx:                ", sig);
+
+    const post = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  post-place trader state on ER:", post);
+    expect(post!.baseLocked > (pre?.baseLocked ?? 0n), "5 base lots got locked")
+      .to.be.true;
+  }).timeout(60_000);
+
+  it("places a crossing BID on the ER → in-engine matching fires", async () => {
+    const pre = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  pre-cross trader state on ER:", pre);
+
+    const sig = await tc.placeLimitOrderOnEr({
+      type: "limit",
+      side: "bid",
+      priceInTicks: 100n,
+      numBaseLots: 3n,
+      selfTradeBehavior: "decrement_take",
+      clientOrderId: 2n,
+    });
+    console.log("  place crossing BID tx:       ", sig);
+
+    const post = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  post-cross trader state on ER:", post);
+    // With DecrementTake self-trade, the resting ask is reduced by 3 base
+    // lots; the locked count on the ask side drops accordingly.
+    expect(post!.baseLocked < pre!.baseLocked, "ask locked decremented by match")
+      .to.be.true;
+  }).timeout(60_000);
+
+  it("swaps on the ER — SwapWithFreeFunds aggressive IOC", async () => {
+    // Place a fresh ask on the other side first so the swap has something
+    // to cross against. Then swap an IOC bid against it.
+    const sigA = await tc.placeLimitOrderOnEr({
+      type: "post_only",
+      side: "ask",
+      priceInTicks: 200n,
+      numBaseLots: 2n,
+      clientOrderId: 10n,
+    });
+    console.log("  resting ask @ 200 tx:        ", sigA);
+
+    const sigSwap = await tc.swapOnEr({
+      type: "ioc",
+      side: "bid",
+      priceInTicks: 200n,
+      numBaseLots: 2n,
+      numQuoteLots: 0n,
+      selfTradeBehavior: "decrement_take",
+      clientOrderId: 11n,
+    });
+    console.log("  swap IOC bid tx:             ", sigSwap);
+  }).timeout(60_000);
+
+  it("cancels all remaining orders on the ER", async () => {
+    const sig = await tc.cancelAllOrdersOnEr();
+    console.log("  cancel-all tx:               ", sig);
+    const post = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  post-cancel trader state ER:", post);
+    expect(post!.baseLocked, "no base lots locked").to.equal(0n);
+    expect(post!.quoteLocked, "no quote lots locked").to.equal(0n);
   }).timeout(60_000);
 
   it("Magic Action deposit — single sig, full chain auto-fires", async () => {
