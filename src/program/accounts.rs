@@ -197,6 +197,64 @@ pub struct DepositReceipt {
 }
 impl ZeroCopy for DepositReceipt {}
 
+/// Base-layer-created authorization that lets an ephemeral keypair sign
+/// trading instructions on the ER on behalf of the real trader.
+///
+/// Lifecycle:
+///   1. The trader calls `CreateSessionToken` with their main wallet,
+///      registering an ephemeral keypair (`session_signer`) and an
+///      expiry. The PDA at `[b"session", owner, session_signer]` is
+///      created with this struct as its data.
+///   2. The trader hands the ephemeral keypair to their UI / frontend.
+///      It signs trading instructions (`PlaceLimitOrderViaSession`,
+///      `SwapViaSession`, `CancelAllOrdersViaSession`) without
+///      prompting the main wallet on each order.
+///   3. When done (or compromised), the trader calls
+///      `RevokeSessionToken` to close the PDA and refund rent.
+///
+/// PDA seeds: `[b"session", owner, session_signer]`
+#[derive(Debug, Clone, Copy, BorshDeserialize, BorshSerialize, Zeroable, Pod)]
+#[repr(C)]
+pub struct SessionToken {
+    pub discriminant: u64,
+    /// The actual trader. Trading operations attribute the order to this
+    /// pubkey regardless of which key signed the transaction.
+    pub owner: Pubkey,
+    /// The ephemeral keypair authorized to sign on behalf of `owner`.
+    pub session_signer: Pubkey,
+    /// Unix timestamp after which the token is invalid. 0 = never expires.
+    pub expires_at: i64,
+    /// Slot at which the token was created (informational).
+    pub created_at_slot: u64,
+    pub bump: u8,
+    _padding: [u8; 7],
+}
+impl ZeroCopy for SessionToken {}
+
+impl SessionToken {
+    pub fn new_init(
+        owner: Pubkey,
+        session_signer: Pubkey,
+        expires_at: i64,
+        created_at_slot: u64,
+        bump: u8,
+    ) -> Result<Self, ProgramError> {
+        Ok(Self {
+            discriminant: get_discriminant::<SessionToken>()?,
+            owner,
+            session_signer,
+            expires_at,
+            created_at_slot,
+            bump,
+            _padding: [0; 7],
+        })
+    }
+
+    pub fn is_expired(&self, now_unix: i64) -> bool {
+        self.expires_at != 0 && now_unix >= self.expires_at
+    }
+}
+
 impl DepositReceipt {
     pub fn new_init(
         trader: Pubkey,

@@ -116,6 +116,17 @@ impl<'a, 'info> Signer<'a, 'info> {
         )?;
         Ok(Self { info })
     }
+
+    /// Constructs a `Signer` *without* checking `is_signer`. Used **only**
+    /// by the session dispatch path, where the actual signing is performed
+    /// by a `session_signer` keypair and authorization for the `owner` is
+    /// proven via a `SessionToken` PDA that has already been verified by
+    /// the caller. Do not use anywhere else.
+    pub(crate) fn new_session_authorized(
+        info: &'a AccountInfo<'info>,
+    ) -> Signer<'a, 'info> {
+        Self { info }
+    }
 }
 
 impl<'a, 'info> AsRef<AccountInfo<'info>> for Signer<'a, 'info> {

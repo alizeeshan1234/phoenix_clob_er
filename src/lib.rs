@@ -176,6 +176,26 @@ pub fn process_instruction(
                 program_id, accounts, data,
             );
         }
+        PhoenixInstruction::CreateSessionToken => {
+            phoenix_log!("PhoenixInstruction::CreateSessionToken");
+            return crate::program::processor::create_session_token::process_create_session_token(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::RevokeSessionToken => {
+            phoenix_log!("PhoenixInstruction::RevokeSessionToken");
+            return crate::program::processor::revoke_session_token::process_revoke_session_token(
+                program_id, accounts, data,
+            );
+        }
+        PhoenixInstruction::PlaceLimitOrderViaSession
+        | PhoenixInstruction::SwapViaSession
+        | PhoenixInstruction::CancelAllOrdersViaSession => {
+            phoenix_log!("PhoenixInstruction::*ViaSession");
+            return crate::program::processor::session::dispatch(
+                instruction, program_id, accounts, data,
+            );
+        }
         _ => {}
     }
 

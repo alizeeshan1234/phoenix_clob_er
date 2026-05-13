@@ -2,6 +2,7 @@ pub mod cancel_multiple_orders;
 pub mod close_deposit_receipt;
 pub mod commit_and_undelegate_market;
 pub mod commit_market;
+pub mod create_session_token;
 pub mod delegate_market;
 pub mod delegate_seat;
 pub mod deposit;
@@ -16,6 +17,8 @@ pub mod process_withdrawal_er;
 pub mod reduce_order;
 pub mod request_deposit;
 pub mod request_withdrawal;
+pub mod revoke_session_token;
+pub mod session;
 pub mod undelegate_market;
 pub mod withdraw;
 

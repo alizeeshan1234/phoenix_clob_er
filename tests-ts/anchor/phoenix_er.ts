@@ -192,6 +192,87 @@ describe("phoenix-er", () => {
     expect(post!.quoteLocked, "no quote lots locked").to.equal(0n);
   }).timeout(60_000);
 
+  // =====================================================================
+  // Session keys — ephemeral signer authorized by the owner wallet
+  // =====================================================================
+
+  let sessionSigner: anchor.web3.Keypair;
+
+  it("creates a SessionToken authorizing an ephemeral keypair", async () => {
+    sessionSigner = anchor.web3.Keypair.generate();
+    console.log("  session_signer:              ", sessionSigner.publicKey.toBase58());
+    const expiresAt = BigInt(Math.floor(Date.now() / 1000) + 3600); // 1 hour
+    const sig = await tc.createSessionToken(sessionSigner.publicKey, expiresAt);
+    console.log("  CreateSessionToken tx:       ", sig);
+
+    const [token] = tc.findSessionTokenAddress(
+      tc.admin.publicKey,
+      sessionSigner.publicKey,
+    );
+    const info = await tc.connection.getAccountInfo(token);
+    expect(info, "session token PDA exists").to.not.be.null;
+    expect(info!.owner.equals(PHOENIX_PROGRAM_ID), "owned by Phoenix").to.be.true;
+  }).timeout(60_000);
+
+  it("session-signed: places an ASK via session key (owner never signs)", async () => {
+    // Fund the session signer so it can pay tx fees on the ER.
+    const transferIx = anchor.web3.SystemProgram.transfer({
+      fromPubkey: tc.admin.publicKey,
+      toPubkey: sessionSigner.publicKey,
+      lamports: 50_000_000,
+    });
+    await tc.provider.sendAndConfirm(new anchor.web3.Transaction().add(transferIx));
+
+    const sig = await tc.placeLimitOrderViaSession(sessionSigner, {
+      type: "post_only",
+      side: "ask",
+      priceInTicks: 150n,
+      numBaseLots: 5n,
+      clientOrderId: 100n,
+    });
+    console.log("  session place ASK tx:        ", sig);
+
+    const post = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  post-place trader state ER:  ", post);
+    expect(post!.baseLocked >= 5n, "ask got locked under owner's TraderState").to.be.true;
+  }).timeout(60_000);
+
+  it("session-signed: cancels orders via session key", async () => {
+    const sig = await tc.cancelAllOrdersViaSession(sessionSigner);
+    console.log("  session cancel-all tx:       ", sig);
+    const post = await tc.readTraderStateFromMarket(tc.routerConnection);
+    console.log("  post-cancel trader state ER: ", post);
+    expect(post!.baseLocked, "all locks released").to.equal(0n);
+  }).timeout(60_000);
+
+  it("revokes the SessionToken (owner signs)", async () => {
+    const sig = await tc.revokeSessionToken(sessionSigner.publicKey);
+    console.log("  RevokeSessionToken tx:       ", sig);
+    const [token] = tc.findSessionTokenAddress(
+      tc.admin.publicKey,
+      sessionSigner.publicKey,
+    );
+    const info = await tc.connection.getAccountInfo(token);
+    expect(info, "session token closed").to.be.null;
+  }).timeout(60_000);
+
+  it("revoked session can no longer place orders", async () => {
+    let failed = false;
+    try {
+      await tc.placeLimitOrderViaSession(sessionSigner, {
+        type: "post_only",
+        side: "ask",
+        priceInTicks: 200n,
+        numBaseLots: 1n,
+        clientOrderId: 999n,
+      });
+    } catch (e: any) {
+      failed = true;
+      console.log("  ✓ revoked session rejected:", String(e.message).slice(0, 80) + "…");
+    }
+    expect(failed, "post-revoke session ix must fail").to.be.true;
+  }).timeout(60_000);
+
   it("Magic Action deposit — single sig, full chain auto-fires", async () => {
     const baseSig = await tc.requestDeposit(new BN(50), new BN(500));
     console.log("  request deposit tx:        ", baseSig);

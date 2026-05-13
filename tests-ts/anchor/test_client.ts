@@ -81,6 +81,11 @@ export const TAG = {
   RequestWithdrawal: 207,
   ProcessWithdrawalEr: 208,
   ExecuteWithdrawalBaseChain: 209,
+  CreateSessionToken: 210,
+  RevokeSessionToken: 211,
+  PlaceLimitOrderViaSession: 212,
+  SwapViaSession: 213,
+  CancelAllOrdersViaSession: 214,
 } as const;
 
 const m = (
@@ -331,6 +336,16 @@ export class TestClient {
         market.toBuffer(),
         trader.toBuffer(),
       ],
+      PHOENIX_PROGRAM_ID,
+    );
+  }
+
+  findSessionTokenAddress(
+    owner: PublicKey,
+    sessionSigner: PublicKey,
+  ): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [Buffer.from("session"), owner.toBuffer(), sessionSigner.toBuffer()],
       PHOENIX_PROGRAM_ID,
     );
   }
@@ -990,6 +1005,161 @@ export class TestClient {
       }
     }
     return null;
+  }
+
+  // ===================================================================
+  // Session keys
+  // ===================================================================
+
+  /** Create a SessionToken authorizing `sessionSigner` to act for the
+   *  admin (owner) until `expiresAt` (unix timestamp, 0 = never). */
+  async createSessionToken(
+    sessionSigner: PublicKey,
+    expiresAt: bigint,
+  ): Promise<string> {
+    const [token] = this.findSessionTokenAddress(this.admin.publicKey, sessionSigner);
+    const data = Buffer.alloc(1 + 32 + 8);
+    data.writeUInt8(TAG.CreateSessionToken, 0);
+    sessionSigner.toBuffer().copy(data, 1);
+    data.writeBigInt64LE(expiresAt, 33);
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(this.admin.publicKey, true, true),
+        m(token, true),
+        m(SystemProgram.programId),
+      ],
+      data,
+    });
+    return await this.provider.sendAndConfirm(new Transaction().add(ix));
+  }
+
+  async revokeSessionToken(sessionSigner: PublicKey): Promise<string> {
+    const [token] = this.findSessionTokenAddress(this.admin.publicKey, sessionSigner);
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(this.admin.publicKey, true, true),
+        m(token, true),
+      ],
+      data: Buffer.from([TAG.RevokeSessionToken]),
+    });
+    return await this.provider.sendAndConfirm(new Transaction().add(ix));
+  }
+
+  /** Send a session-signed ix to the ER via the Magic Router. The
+   *  `sessionSigner` keypair signs the tx (not the admin/owner wallet). */
+  private async sendSessionOnRouter(
+    sessionSigner: Keypair,
+    ix: TransactionInstruction,
+  ): Promise<string> {
+    const tx = new Transaction().add(ix);
+    const { blockhash } = await this.routerConnection.getLatestBlockhash();
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = sessionSigner.publicKey;
+    tx.sign(sessionSigner);
+    const sig = await this.routerConnection.sendRawTransaction(tx.serialize(), {
+      skipPreflight: true,
+    });
+    await this.routerConnection.confirmTransaction(sig, "confirmed");
+    for (let i = 0; i < 10; i++) {
+      const tx2 = await this.routerConnection.getTransaction(sig, {
+        commitment: "confirmed",
+        maxSupportedTransactionVersion: 0,
+      });
+      if (tx2) {
+        if (tx2.meta?.err) {
+          const logs = (tx2.meta.logMessages ?? []).join("\n  ");
+          throw new Error(
+            `Session tx ${sig} failed on-chain: ${JSON.stringify(tx2.meta.err)}\n  ${logs}`,
+          );
+        }
+        return sig;
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+    throw new Error(`Session tx ${sig} not retrievable after confirmation`);
+  }
+
+  /** Place a limit order on the ER signed by a session key (not the
+   *  owner wallet). The order is attributed to `this.admin` (owner). */
+  async placeLimitOrderViaSession(
+    sessionSigner: Keypair,
+    packet: OrderPacket,
+  ): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const [seat] = this.findSeatAddress(this.market, this.admin.publicKey);
+    const [token] = this.findSessionTokenAddress(
+      this.admin.publicKey,
+      sessionSigner.publicKey,
+    );
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(sessionSigner.publicKey, true, true),
+        m(this.admin.publicKey),
+        m(token),
+        m(seat),
+      ],
+      data: Buffer.concat([
+        Buffer.from([TAG.PlaceLimitOrderViaSession]),
+        encodeOrderPacket(packet),
+      ]),
+    });
+    return await this.sendSessionOnRouter(sessionSigner, ix);
+  }
+
+  async swapViaSession(
+    sessionSigner: Keypair,
+    packet: OrderPacket,
+  ): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const [seat] = this.findSeatAddress(this.market, this.admin.publicKey);
+    const [token] = this.findSessionTokenAddress(
+      this.admin.publicKey,
+      sessionSigner.publicKey,
+    );
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(sessionSigner.publicKey, true, true),
+        m(this.admin.publicKey),
+        m(token),
+        m(seat),
+      ],
+      data: Buffer.concat([
+        Buffer.from([TAG.SwapViaSession]),
+        encodeOrderPacket(packet),
+      ]),
+    });
+    return await this.sendSessionOnRouter(sessionSigner, ix);
+  }
+
+  async cancelAllOrdersViaSession(sessionSigner: Keypair): Promise<string> {
+    const [logAuth] = this.findLogAuthority();
+    const [token] = this.findSessionTokenAddress(
+      this.admin.publicKey,
+      sessionSigner.publicKey,
+    );
+    const ix = new TransactionInstruction({
+      programId: PHOENIX_PROGRAM_ID,
+      keys: [
+        m(PHOENIX_PROGRAM_ID),
+        m(logAuth),
+        m(this.market, true),
+        m(sessionSigner.publicKey, true, true),
+        m(this.admin.publicKey),
+        m(token),
+      ],
+      data: Buffer.from([TAG.CancelAllOrdersViaSession]),
+    });
+    return await this.sendSessionOnRouter(sessionSigner, ix);
   }
 
   /** Smoke-test: CancelAllOrdersWithFreeFunds on the ER. */

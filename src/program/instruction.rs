@@ -413,6 +413,49 @@ pub enum PhoenixInstruction {
     #[account(6, name = "token_program", desc = "SPL Token program")]
     #[account(7, writable, name = "receipt", desc = "Processed WithdrawalReceipt PDA")]
     ExecuteWithdrawalBaseChain = 209,
+
+    /// Create a `SessionToken` PDA so an ephemeral keypair can sign
+    /// trading ixs on behalf of the owner. Base layer, owner-signed.
+    #[account(0, writable, signer, name = "owner", desc = "Real trader; pays rent and signs")]
+    #[account(1, writable, name = "session_token", desc = "SessionToken PDA, seeds [b'session', owner, session_signer]")]
+    #[account(2, name = "system_program", desc = "System program")]
+    CreateSessionToken = 210,
+
+    /// Close a `SessionToken` PDA and refund rent to the owner. Base layer.
+    #[account(0, writable, signer, name = "owner", desc = "Real trader; lamport destination")]
+    #[account(1, writable, name = "session_token", desc = "SessionToken PDA")]
+    RevokeSessionToken = 211,
+
+    /// Place a limit order using a session token. The `session_signer`
+    /// signs; the order is attributed to `owner` (from session_token).
+    /// Runs on the ER like PlaceLimitOrderWithFreeFunds.
+    #[account(0, name = "phoenix_program", desc = "Phoenix program")]
+    #[account(1, name = "log_authority", desc = "Phoenix log authority")]
+    #[account(2, writable, name = "market", desc = "Delegated market")]
+    #[account(3, signer, name = "session_signer", desc = "Ephemeral session keypair")]
+    #[account(4, name = "owner", desc = "Real trader (from session_token)")]
+    #[account(5, name = "session_token", desc = "SessionToken PDA proving session_signer can sign for owner")]
+    #[account(6, name = "seat", desc = "Owner's seat PDA")]
+    PlaceLimitOrderViaSession = 212,
+
+    /// Swap (IOC) using a session token.
+    #[account(0, name = "phoenix_program", desc = "Phoenix program")]
+    #[account(1, name = "log_authority", desc = "Phoenix log authority")]
+    #[account(2, writable, name = "market", desc = "Delegated market")]
+    #[account(3, signer, name = "session_signer", desc = "Ephemeral session keypair")]
+    #[account(4, name = "owner", desc = "Real trader (from session_token)")]
+    #[account(5, name = "session_token", desc = "SessionToken PDA")]
+    #[account(6, name = "seat", desc = "Owner's seat PDA")]
+    SwapViaSession = 213,
+
+    /// Cancel all orders using a session token.
+    #[account(0, name = "phoenix_program", desc = "Phoenix program")]
+    #[account(1, name = "log_authority", desc = "Phoenix log authority")]
+    #[account(2, writable, name = "market", desc = "Delegated market")]
+    #[account(3, signer, name = "session_signer", desc = "Ephemeral session keypair")]
+    #[account(4, name = "owner", desc = "Real trader (from session_token)")]
+    #[account(5, name = "session_token", desc = "SessionToken PDA")]
+    CancelAllOrdersViaSession = 214,
 }
 
 impl PhoenixInstruction {

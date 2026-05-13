@@ -52,6 +52,14 @@ pub fn get_withdrawal_receipt_address(market: &Pubkey, trader: &Pubkey) -> (Pubk
     )
 }
 
+/// PDA address for a session token: seeds `[b"session", owner, session_signer]`.
+pub fn get_session_token_address(owner: &Pubkey, session_signer: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"session", owner.as_ref(), session_signer.as_ref()],
+        &crate::ID,
+    )
+}
+
 pub(crate) struct PhoenixLogContext<'a, 'info> {
     pub(crate) phoenix_program: Program<'a, 'info>,
     pub(crate) log_authority: PDA<'a, 'info>,
