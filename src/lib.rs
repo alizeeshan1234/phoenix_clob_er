@@ -16,7 +16,6 @@
 mod log;
 pub mod program;
 pub mod quantities;
-// Note this mod is private and only exists for the purposes of IDL generation
 mod shank_structs;
 pub mod state;
 
