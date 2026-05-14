@@ -56,7 +56,7 @@ declare_id!("AwCrmRz5wSst99eYA7to6vtqCQ7QmCkxV29gVFxwMUXb");
 /// Static PDA with seeds `[b"log"]`. Used by the program's self-CPI event
 /// recorder so client indexers can parse inner-instruction data without
 /// trusting the caller.
-///
+
 /// If the program id changes, this address (and its bump) must be
 /// recomputed. The compile-time `declare_pda!` from ellipsis-macros (1.14
 /// era) is replaced here by an inline `pubkey!` constant for the address
