@@ -1,0 +1,27 @@
+{
+  "name": "perp-router-er-tests",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Devnet E2E tests for perp_router + MagicBlock Ephemeral Rollup",
+  "scripts": {
+    "test": "mocha --require ts-node/register --timeout 300000 perp_router_er.ts",
+    "test:direct": "mocha --require ts-node/register --timeout 180000 perp_router_direct.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1",
+    "@magicblock-labs/ephemeral-rollups-sdk": "0.6.5",
+    "@solana/spl-token": "^0.4.6",
+    "@solana/web3.js": "^1.95.0",
+    "bn.js": "^5.2.1"
+  },
+  "devDependencies": {
+    "@types/bn.js": "^5.1.5",
+    "@types/chai": "^4.3.20",
+    "@types/mocha": "^10.0.9",
+    "@types/node": "^20.16.0",
+    "chai": "^4.5.0",
+    "mocha": "^10.7.3",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.0"
+  }
+}

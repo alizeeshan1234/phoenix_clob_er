@@ -1,10 +1,17 @@
-
 target
 target-docker
 test-ledger
 **/*.rs.bk
 **/node_modules
 **/.crates
+
+# Solana program upgrade keypairs — never commit.
+**/target/deploy/*-keypair*.json
+
+# JS lockfiles for test packages
 yarn.lock
 package-lock.json
+
+# Per-test ER state caches
 tests-ts/.devnet-state.json
+**/tests-ts/.devnet-state.json

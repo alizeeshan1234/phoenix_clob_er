@@ -3098,36 +3098,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "perp-router"
-version = "0.1.0"
-dependencies = [
- "bincode",
- "borsh 0.10.4",
- "bytemuck",
- "ephemeral-rollups-sdk",
- "lib-sokoban",
- "magicblock-delegation-program-api",
- "magicblock-magic-program-api",
- "num_enum 0.5.11",
- "phoenix-v1",
- "rand 0.8.5",
- "sha2 0.10.9",
- "shank",
- "solana-instruction 3.4.0",
- "solana-invoke",
- "solana-logger",
- "solana-program",
- "solana-program-test",
- "solana-sdk",
- "solana-security-txt",
- "spl-associated-token-account",
- "spl-token",
- "static_assertions",
- "thiserror 1.0.69",
- "tokio",
-]
-
-[[package]]
 name = "phoenix-v1"
 version = "0.2.4"
 dependencies = [
