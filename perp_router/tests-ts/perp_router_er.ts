@@ -42,6 +42,7 @@ describe("perp-router-er (devnet, ER trading)", () => {
   let quoteMint: Keypair;
   let traderAta: PublicKey;
   let perpMarketPda: PublicKey;
+  let orderbookPubkey: PublicKey;
 
   before(async () => {
     console.log("Program ID:    ", PERP_ROUTER_PROGRAM_ID.toBase58());
@@ -82,7 +83,7 @@ describe("perp-router-er (devnet, ER trading)", () => {
     console.log("    traderAta:", traderAta.toBase58());
   });
 
-  it("2. init — GlobalState (idempotent) + PerpMarket + TraderAccount", async () => {
+  it("2. init — GlobalState (idempotent) + PerpMarket + TraderAccount + Orderbook", async () => {
     const [g] = tc.globalStatePda();
     const gInfo = await tc.baseConnection.getAccountInfo(g);
     if (!gInfo) {
@@ -101,6 +102,32 @@ describe("perp-router-er (devnet, ER trading)", () => {
     [perpMarketPda] = tc.perpMarketPda(PHOENIX_MARKET);
     console.log("    init market:  ", s2);
     console.log("    init trader:  ", s3);
+
+    // Orderbook: in-process phoenix FIFOMarket<Pubkey, 512, 512, 128>,
+    // ~82 KB. Keypair-allocated by the client (CPI'd create_account caps
+    // at 10 KB), assigned to perp_router, then initialised in the same tx.
+    const PERP_ORDERBOOK_SIZE = 84_368;
+    const { orderbook, sig: s4 } = await tc.initializeOrderbook(
+      perpMarketPda,
+      new BN(1),
+      new BN(1),
+      0,
+      PERP_ORDERBOOK_SIZE,
+    );
+    orderbookPubkey = orderbook.publicKey;
+    console.log("    init orderbook:", s4);
+    console.log("    orderbook key: ", orderbook.publicKey.toBase58());
+    const obInfo = await tc.baseConnection.getAccountInfo(orderbook.publicKey);
+    assert(obInfo, "orderbook account must exist after init");
+    assert(
+      obInfo!.owner.equals(PERP_ROUTER_PROGRAM_ID),
+      `orderbook owner = ${obInfo!.owner.toBase58()}, expected perp_router`,
+    );
+    assert(
+      obInfo!.data.length === PERP_ORDERBOOK_SIZE,
+      `orderbook size = ${obInfo!.data.length}, expected ${PERP_ORDERBOOK_SIZE}`,
+    );
+    console.log("    orderbook size:", obInfo!.data.length, "bytes");
   });
 
   it("3. (base) delegate GlobalState + PerpMarket + TraderAccount to ER", async () => {

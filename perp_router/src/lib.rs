@@ -102,6 +102,9 @@ pub enum PerpRouterInstruction {
     // trading demos before a real Phoenix market exists on the ER. ---
     DirectOpenPosition = 22,
     DirectClosePosition = 23,
+
+    // --- In-tree orderbook (vendored phoenix matching engine, no CPI) ---
+    InitializeOrderbook = 24,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -203,6 +206,9 @@ pub fn process_instruction(
         }
         PerpRouterInstruction::DirectClosePosition => {
             instructions::direct_close_position::process(program_id, accounts, data)
+        }
+        PerpRouterInstruction::InitializeOrderbook => {
+            instructions::initialize_orderbook::process(program_id, accounts, data)
         }
     }
 }

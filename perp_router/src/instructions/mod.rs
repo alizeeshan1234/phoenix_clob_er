@@ -14,6 +14,7 @@ pub mod direct_withdraw;
 pub mod execute_collateral_withdrawal_base_chain;
 pub mod initialize_global_state;
 pub mod initialize_market;
+pub mod initialize_orderbook;
 pub mod initialize_trader;
 pub mod liquidate;
 pub mod mature_pnl;

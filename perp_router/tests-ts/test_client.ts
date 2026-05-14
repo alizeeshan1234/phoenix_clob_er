@@ -78,6 +78,7 @@ export const TAG = {
   DirectWithdraw: 21,
   DirectOpenPosition: 22,
   DirectClosePosition: 23,
+  InitializeOrderbook: 24,
 } as const;
 
 // PDA seed prefixes (matches perp_router/src/constants.rs).
@@ -106,6 +107,11 @@ const i64 = (n: number | bigint | BN) => {
 const u32 = (n: number) => {
   const buf = Buffer.alloc(4);
   buf.writeUInt32LE(n, 0);
+  return buf;
+};
+const u16 = (n: number) => {
+  const buf = Buffer.alloc(2);
+  buf.writeUInt16LE(n, 0);
   return buf;
 };
 const u8 = (n: number) => Buffer.from([n & 0xff]);
@@ -352,6 +358,49 @@ export class PerpTestClient {
       data,
     });
     return this.sendBase([ix]);
+  }
+
+  /**
+   * Two-ix tx: client allocates the ~82 KB orderbook account at full size
+   * (top-level SystemProgram.createAccount; CPI'd allocations cap at 10 KB)
+   * + perp_router::initialize_orderbook to write the FIFOMarket layout.
+   * Returns the fresh orderbook keypair so the caller can reference it.
+   */
+  async initializeOrderbook(
+    perpMarket: PublicKey,
+    tickSizeInQuoteLotsPerBaseUnit: BN,
+    baseLotsPerBaseUnit: BN,
+    takerFeeBps: number,
+    orderbookSize: number,
+  ): Promise<{ orderbook: Keypair; sig: string }> {
+    const orderbook = Keypair.generate();
+    const lamports = await this.baseConnection.getMinimumBalanceForRentExemption(
+      orderbookSize,
+    );
+    const createIx = SystemProgram.createAccount({
+      fromPubkey: this.payer.publicKey,
+      newAccountPubkey: orderbook.publicKey,
+      lamports,
+      space: orderbookSize,
+      programId: PERP_ROUTER_PROGRAM_ID,
+    });
+    const data = Buffer.concat([
+      u8(TAG.InitializeOrderbook),
+      u64(tickSizeInQuoteLotsPerBaseUnit),
+      u64(baseLotsPerBaseUnit),
+      u16(takerFeeBps),
+    ]);
+    const initIx = new TransactionInstruction({
+      programId: PERP_ROUTER_PROGRAM_ID,
+      keys: [
+        { pubkey: this.admin.publicKey, isSigner: true, isWritable: true },
+        { pubkey: perpMarket, isSigner: false, isWritable: false },
+        { pubkey: orderbook.publicKey, isSigner: false, isWritable: true },
+      ],
+      data,
+    });
+    const sig = await this.sendBase([createIx, initIx], [orderbook], "initializeOrderbook");
+    return { orderbook, sig };
   }
 
   async initializeTrader(owner: Keypair): Promise<string> {
