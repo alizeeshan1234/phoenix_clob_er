@@ -1,18 +1,35 @@
 //! PlaceOrderPerp — ER hot path. Pushes a limit order into the in-tree
-//! Phoenix matching engine on `PerpOrderbook`, captures any fills, and
-//! settles both taker and maker `TraderAccount.positions[]` plus margin
-//! bookkeeping.
+//! Phoenix matching engine on `PerpOrderbook`, captures fills, and
+//! settles both taker and maker `TraderAccount` state — including PnL
+//! realization on closing fills.
 //!
-//! Stage 3b scope:
+//! Stage 3c scope (this revision):
 //!   - Posted portion (no cross): reserves margin from `collateral`
-//!     into `locked_margin` (Stage 3a behavior, unchanged).
-//!   - Filled portion (crossed against resting liquidity): for each
-//!     Fill event the matching engine emits,
-//!       * taker: debit `collateral` for the fill's margin, push the
-//!         fill into `positions[market]` with VWAP-blended entry price.
-//!       * maker: release `locked_margin` (was reserved when their
-//!         order rested), push the opposite-side fill into their
-//!         `positions[market]` with VWAP blend.
+//!     into `locked_margin` (Stage 3a).
+//!   - Filled portion (crosses resting liquidity): for each fill,
+//!     `apply_fill_to_position` dispatches by case:
+//!       * OPEN / SCALE-UP (same sign or first entry): VWAP-blend the
+//!         fill into positions[market] and consume margin from the
+//!         appropriate source (taker → free collateral; maker →
+//!         locked_margin reservation).
+//!       * CLOSE (opposite sign, |fill| ≤ |existing|): realize PnL on
+//!         the closed portion (profit → pnl_reserve with WARMUP_SLOTS,
+//!         loss → debit collateral), release proportional
+//!         position.margin_locked back to collateral. The fill itself
+//!         consumes no new margin since it's an unwind. For makers, the
+//!         resting order's locked_margin is always released regardless.
+//!       * FLIP (opposite sign, |fill| > |existing|): close fully (as
+//!         above), then open the remainder in the opposite direction
+//!         at fill_price with proportional margin.
+//!
+//! Funding accrual and Percolator side-index (A-coefficient) effects on
+//! PnL are NOT applied here — Stage 3d gap. `DirectClosePosition` still
+//! has the full risk-engine flow.
+//!
+//! Unit assumption: in v1 the orderbook is configured with
+//! `tick_size=1, base_lots_per_base_unit=1` so prices in ticks map 1:1
+//! to oracle/quote units. Heterogeneous lot params will need a scaling
+//! step in `notional_to_margin`.
 //!
 //! Account list:
 //!   [0] trader         (signer)
@@ -20,15 +37,7 @@
 //!   [2] perp_market    (readonly; for max_leverage_bps + orderbook PDA)
 //!   [3] orderbook      (writable, delegated)
 //!   [4..] maker_accounts (writable, delegated) — one TraderAccount per
-//!         maker the caller expects to fill against. Looked up by
-//!         pubkey-matching the derived TraderAccount PDA against
-//!         `Fill.maker_id`. Caller off-chain scans the book to discover.
-//!
-//! Instruction data (borsh):
-//!   side: u8                  (0=Bid, 1=Ask — matches `phoenix::state::Side`)
-//!   price_in_ticks: u64
-//!   num_base_lots: u64
-//!   client_order_id: u128
+//!         maker the caller expects to fill against.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID;
@@ -50,15 +59,16 @@ use solana_program::{
 use std::mem::size_of;
 
 use crate::{
-    constants::MAX_POSITIONS,
+    constants::{MAX_POSITIONS, WARMUP_SLOTS},
     error::{assert_with_msg, PerpRouterError},
+    risk::warmup::push_reserve,
     state::{trader_account::Position, PerpMarket, PerpOrderbook, TraderAccount},
     validation::loaders::{find_orderbook_address, find_trader_account_address},
 };
 
-/// Max fills the engine may emit for a single PlaceOrderPerp call.
-/// Bounded by Solana's per-tx account cap (~64): each fill needs the
-/// maker's TraderAccount in remaining-accounts.
+/// Max fills the engine may emit per call. Bounded by Solana's per-tx
+/// account cap — each fill needs the maker's TraderAccount in
+/// remaining-accounts.
 const MAX_FILLS_PER_IX: usize = 8;
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -69,7 +79,6 @@ pub struct PlaceOrderPerpParams {
     pub client_order_id: u128,
 }
 
-/// A single Fill captured from the matching engine's event stream.
 #[derive(Copy, Clone, Default)]
 struct CapturedFill {
     maker_id: Pubkey,
@@ -77,10 +86,17 @@ struct CapturedFill {
     base_lots_filled: u64,
 }
 
-/// Notional → required margin. Inputs are in raw quote lots (i.e. the
-/// matching engine's accounting unit). Output is in the same unit, which
-/// for the v1 lot params (`tick_size=1, base_lots_per_base_unit=1`) is
-/// 1:1 with `TraderAccount.collateral` quote atoms.
+/// Where the margin for an incoming fill comes from. Taker → debit free
+/// `collateral`. Maker → consume the existing `locked_margin` reservation
+/// that backed the resting order.
+#[derive(Copy, Clone, Eq, PartialEq)]
+enum MarginSource {
+    FreeCollateral,
+    LockedMargin,
+}
+
+/// `quote_notional × 10_000 / max_leverage_bps`. Assumes tick / lot
+/// params of 1:1 (see file header).
 fn notional_to_margin(quote_notional: u64, max_leverage_bps: u32) -> Result<u64, ProgramError> {
     assert_with_msg(
         max_leverage_bps > 0,
@@ -93,8 +109,7 @@ fn notional_to_margin(quote_notional: u64, max_leverage_bps: u32) -> Result<u64,
         .map(|n| n / max_leverage_bps as u64)
 }
 
-/// Find a position slot for `market` in `t.positions`; allocate a new
-/// slot if absent. Returns the slot index.
+/// Find a position slot for `market`; allocate a new slot if absent.
 fn position_slot(t: &mut TraderAccount, market: &Pubkey) -> Result<usize, ProgramError> {
     for i in 0..(t.positions_len as usize) {
         if t.positions[i].market == *market {
@@ -111,53 +126,151 @@ fn position_slot(t: &mut TraderAccount, market: &Pubkey) -> Result<usize, Progra
     Ok(i)
 }
 
-/// VWAP-blend a new fill into an existing position. `signed_size` is +ve
-/// for longs (buys), -ve for shorts (sells). `margin_used` is added to
-/// `positions[].margin_locked`.
-fn blend_fill_into_position(
+/// Settle one fill into `t.positions[market]`, moving margin between
+/// `collateral` / `locked_margin` / `position.margin_locked` as the case
+/// requires and realizing PnL on any closed portion. See file header
+/// for the case dispatch.
+fn apply_fill_to_position(
     t: &mut TraderAccount,
     market: &Pubkey,
     signed_size: i64,
     fill_price: u64,
-    margin_used: u64,
+    fill_margin: u64,
+    source: MarginSource,
+    current_slot: u64,
 ) -> ProgramResult {
+    // Maker side: always release the resting order's reservation first.
+    if source == MarginSource::LockedMargin {
+        t.locked_margin = t
+            .locked_margin
+            .checked_sub(fill_margin)
+            .ok_or(PerpRouterError::MathOverflow)?;
+    }
+
     let slot = position_slot(t, market)?;
     let pos = &mut t.positions[slot];
+    let old = pos.size_stored;
+    let same_sign = old == 0 || ((old > 0) == (signed_size > 0));
 
-    let old_abs = pos.size_stored.unsigned_abs() as u128;
-    let added_abs = signed_size.unsigned_abs() as u128;
-    let blended_entry = if old_abs == 0 {
-        fill_price
-    } else {
-        let num = old_abs
-            .checked_mul(pos.entry_price as u128)
-            .ok_or(PerpRouterError::MathOverflow)?
-            .checked_add(
-                added_abs
-                    .checked_mul(fill_price as u128)
-                    .ok_or(PerpRouterError::MathOverflow)?,
-            )
+    if same_sign {
+        // ── OPEN or SCALE-UP ──────────────────────────────────────────
+        // Taker pays from collateral; maker's reservation already
+        // released — its `fill_margin` worth conceptually transfers to
+        // `position.margin_locked`, no further collateral move needed.
+        if source == MarginSource::FreeCollateral {
+            t.collateral = t
+                .collateral
+                .checked_sub(fill_margin)
+                .ok_or(PerpRouterError::InsufficientCollateral)?;
+        }
+
+        let old_abs = old.unsigned_abs() as u128;
+        let added_abs = signed_size.unsigned_abs() as u128;
+        pos.entry_price = if old_abs == 0 {
+            fill_price
+        } else {
+            let num = old_abs
+                .checked_mul(pos.entry_price as u128)
+                .ok_or(PerpRouterError::MathOverflow)?
+                .checked_add(
+                    added_abs
+                        .checked_mul(fill_price as u128)
+                        .ok_or(PerpRouterError::MathOverflow)?,
+                )
+                .ok_or(PerpRouterError::MathOverflow)?;
+            let den = old_abs
+                .checked_add(added_abs)
+                .ok_or(PerpRouterError::MathOverflow)?
+                .max(1);
+            (num / den) as u64
+        };
+        pos.size_stored = pos
+            .size_stored
+            .checked_add(signed_size)
             .ok_or(PerpRouterError::MathOverflow)?;
-        let den = old_abs
-            .checked_add(added_abs)
+        pos.margin_locked = pos
+            .margin_locked
+            .checked_add(fill_margin)
+            .ok_or(PerpRouterError::MathOverflow)?;
+    } else {
+        // ── CLOSE (or CLOSE + FLIP) ───────────────────────────────────
+        let old_abs = old.unsigned_abs();
+        let fill_abs = signed_size.unsigned_abs();
+        let closed = old_abs.min(fill_abs);
+
+        // PnL on closed portion. Long closed by selling at higher
+        // price → profit. Short closed by buying at lower → profit.
+        let pnl_per_unit: i128 = if old > 0 {
+            (fill_price as i128) - (pos.entry_price as i128)
+        } else {
+            (pos.entry_price as i128) - (fill_price as i128)
+        };
+        let pnl_raw: i128 = pnl_per_unit
+            .checked_mul(closed as i128)
+            .ok_or(PerpRouterError::MathOverflow)?;
+
+        // Proportional release of existing position margin → collateral.
+        let released = ((pos.margin_locked as u128)
+            .checked_mul(closed as u128)
             .ok_or(PerpRouterError::MathOverflow)?
-            .max(1);
-        (num / den) as u64
-    };
-    pos.entry_price = blended_entry;
-    pos.size_stored = pos
-        .size_stored
-        .checked_add(signed_size)
-        .ok_or(PerpRouterError::MathOverflow)?;
-    pos.margin_locked = pos
-        .margin_locked
-        .checked_add(margin_used)
-        .ok_or(PerpRouterError::MathOverflow)?;
+            / (old_abs as u128).max(1)) as u64;
+        pos.margin_locked = pos.margin_locked.saturating_sub(released);
+        t.collateral = t
+            .collateral
+            .checked_add(released)
+            .ok_or(PerpRouterError::MathOverflow)?;
+
+        // PnL: profit → reserve with warmup. Loss → debit collateral
+        // (capped at zero — bankruptcy is silent for v1; v2 should
+        // mark the trader liquidatable).
+        if pnl_raw > 0 {
+            push_reserve(
+                &mut t.pnl_reserve,
+                &mut t.pnl_reserve_len,
+                pnl_raw as u64,
+                current_slot.saturating_add(WARMUP_SLOTS),
+            )?;
+        } else if pnl_raw < 0 {
+            let loss = pnl_raw.unsigned_abs() as u64;
+            t.collateral = t.collateral.saturating_sub(loss);
+        }
+
+        // Update size for the closed portion.
+        let new_size = old
+            .checked_add(signed_size)
+            .ok_or(PerpRouterError::MathOverflow)?;
+        pos.size_stored = new_size;
+
+        if new_size == 0 {
+            // Pure full close: zero metadata. (Slot stays allocated
+            // for the same market; reused on next open.)
+            pos.entry_price = 0;
+            pos.margin_locked = 0;
+        } else if fill_abs > old_abs {
+            // Flip: leftover opens opposite direction at fill_price.
+            let leftover_abs = fill_abs - old_abs;
+            let leftover_margin = ((fill_margin as u128)
+                .checked_mul(leftover_abs as u128)
+                .ok_or(PerpRouterError::MathOverflow)?
+                / (fill_abs as u128).max(1)) as u64;
+            if source == MarginSource::FreeCollateral {
+                t.collateral = t
+                    .collateral
+                    .checked_sub(leftover_margin)
+                    .ok_or(PerpRouterError::InsufficientCollateral)?;
+            }
+            pos.entry_price = fill_price;
+            pos.margin_locked = leftover_margin;
+        }
+        // Else: partial close — entry_price preserved for the remaining
+        // same-sign exposure.
+    }
+
     Ok(())
 }
 
-/// Find the maker's `TraderAccount` in `remaining_accounts` by deriving
-/// its PDA and matching pubkeys.
+/// Locate the maker's `TraderAccount` in `remaining` by deriving the
+/// expected PDA from `maker_id`.
 fn find_maker_account<'a, 'info>(
     remaining: &'a [AccountInfo<'info>],
     maker_id: &Pubkey,
@@ -188,7 +301,6 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let trader_account_info = next_account_info(it)?;
     let perp_market_info = next_account_info(it)?;
     let orderbook_info = next_account_info(it)?;
-    // Anything left is the variable-length maker-account tail.
     let remaining_accounts: &[AccountInfo] = it.as_slice();
 
     assert_with_msg(
@@ -224,9 +336,9 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         m.max_leverage_bps
     };
 
-    // Worst-case margin pre-check (full size posts uncrossed). If the
-    // trader has the headroom for the entire order resting, they
-    // definitely have enough for the fill+rest mix.
+    // Worst-case margin pre-check (full size posts uncrossed). Closing
+    // fills release margin rather than consume it, so this strictly
+    // over-estimates — safe.
     let worst_quote_notional = p
         .price_in_ticks
         .checked_mul(p.num_base_lots)
@@ -258,14 +370,12 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         false,
     );
 
-    // Capture fill events on the stack so we can settle both sides of
-    // every match after the matching engine returns and the orderbook
-    // borrow is dropped.
     let mut fills: [CapturedFill; MAX_FILLS_PER_IX] = [CapturedFill::default(); MAX_FILLS_PER_IX];
     let mut fill_count: usize = 0;
     let mut overflow = false;
 
     let clock = Clock::get()?;
+    let current_slot = clock.slot;
     let mut get_clock_fn = || (clock.slot, clock.unix_timestamp as u64);
 
     let (resting_order_id, response) = {
@@ -304,8 +414,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         "matching engine emitted more fills than MAX_FILLS_PER_IX",
     )?;
 
-    // ── Apply each fill: taker debits collateral, maker releases
-    //    locked_margin; both sides get a position update.
+    // ── Settle every captured fill on both taker and maker sides.
     let market_key = *perp_market_info.key;
     for i in 0..fill_count {
         let fill = fills[i];
@@ -315,26 +424,27 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             .ok_or(PerpRouterError::MathOverflow)?;
         let fill_margin = notional_to_margin(fill_notional, max_leverage_bps)?;
 
-        // Taker side: Bid → long (+size). Ask → short (-size).
         let taker_signed: i64 = match side {
             Side::Bid => fill.base_lots_filled as i64,
             Side::Ask => -(fill.base_lots_filled as i64),
         };
+
         {
             let mut buf = trader_account_info.try_borrow_mut_data()?;
             let t = bytemuck::from_bytes_mut::<TraderAccount>(
                 &mut buf[..size_of::<TraderAccount>()],
             );
-            t.collateral = t
-                .collateral
-                .checked_sub(fill_margin)
-                .ok_or(PerpRouterError::InsufficientCollateral)?;
-            blend_fill_into_position(t, &market_key, taker_signed, fill.price_in_ticks, fill_margin)?;
+            apply_fill_to_position(
+                t,
+                &market_key,
+                taker_signed,
+                fill.price_in_ticks,
+                fill_margin,
+                MarginSource::FreeCollateral,
+                current_slot,
+            )?;
         }
 
-        // Maker side: opposite sign from taker. Their resting order
-        // backed the locked_margin reservation; release it here, transfer
-        // into the new position's margin_locked.
         let maker_account = find_maker_account(remaining_accounts, &fill.maker_id, program_id)?;
         assert_with_msg(
             maker_account.owner == &crate::ID || maker_account.owner == &DELEGATION_PROGRAM_ID,
@@ -346,16 +456,21 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             let m = bytemuck::from_bytes_mut::<TraderAccount>(
                 &mut buf[..size_of::<TraderAccount>()],
             );
-            m.locked_margin = m
-                .locked_margin
-                .checked_sub(fill_margin)
-                .ok_or(PerpRouterError::InsufficientCollateral)?;
-            blend_fill_into_position(m, &market_key, -taker_signed, fill.price_in_ticks, fill_margin)?;
+            apply_fill_to_position(
+                m,
+                &market_key,
+                -taker_signed,
+                fill.price_in_ticks,
+                fill_margin,
+                MarginSource::LockedMargin,
+                current_slot,
+            )?;
         }
     }
 
-    // ── Posted (uncrossed) portion: reserve margin from free collateral
-    //    into locked_margin. Same logic as Stage 3a.
+    // ── Posted (uncrossed) portion: reserve margin into locked_margin
+    //    (Stage 3a). Closing fills don't post; only fresh outstanding
+    //    quote sits on the book.
     let posted_quote_notional: u64 = match side {
         Side::Bid => u64::from(response.num_quote_lots_posted),
         Side::Ask => p

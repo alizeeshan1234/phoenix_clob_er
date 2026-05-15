@@ -1148,6 +1148,55 @@ export class PerpTestClient {
   }
 
   /**
+   * Sum of all unmatured `pnl_reserve` entries (raw, no warmup gate).
+   * Layout: pnl_reserve starts at offset 56, 16 entries × 16 bytes each
+   * (amount u64 + mature_slot u64). pnl_reserve_len u8 lives at offset
+   * 56 + 256 = 312.
+   */
+  async getTraderPnlReserveTotal(owner: PublicKey): Promise<BN> {
+    const [pda] = this.traderAccountPda(owner);
+    const a = await this.getLiveAccount(pda);
+    if (!a) return new BN(0);
+    const len = a.data[312];
+    let total = new BN(0);
+    for (let i = 0; i < len; i++) {
+      const off = 56 + i * 16;
+      total = total.add(new BN(a.data.subarray(off, off + 8), "le"));
+    }
+    return total;
+  }
+
+  /**
+   * Walk positions[] for the trader's slot matching `market`. Returns
+   * null if no slot has been allocated for that market. Use this in
+   * place of getTraderPosition0 when a trader can have stale slots
+   * from prior runs (e.g. the wallet keypair when reused across spec
+   * files).
+   */
+  async getTraderPositionForMarket(
+    owner: PublicKey,
+    market: PublicKey,
+  ): Promise<{ size_stored: BN; entry_price: BN; margin_locked: BN } | null> {
+    const [pda] = this.traderAccountPda(owner);
+    const a = await this.getLiveAccount(pda);
+    if (!a) return null;
+    const positionsLen = a.data[960];
+    for (let i = 0; i < positionsLen; i++) {
+      const off = 320 + i * 80;
+      const m = new PublicKey(a.data.subarray(off, off + 32));
+      if (!m.equals(market)) continue;
+      const sizeRaw = new BN(a.data.subarray(off + 32, off + 40), "le");
+      const sizeSigned = sizeRaw.testn(63) ? sizeRaw.fromTwos(64) : sizeRaw;
+      return {
+        size_stored: sizeSigned,
+        entry_price: new BN(a.data.subarray(off + 40, off + 48), "le"),
+        margin_locked: new BN(a.data.subarray(off + 48, off + 56), "le"),
+      };
+    }
+    return null;
+  }
+
+  /**
    * Parse the trader's first Position entry. Layout (offsets within
    * TraderAccount):
    *   320: positions[] start (Position is 80 bytes: market 32 + size_stored
