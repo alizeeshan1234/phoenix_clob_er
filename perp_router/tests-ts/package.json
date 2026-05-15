@@ -5,7 +5,8 @@
   "description": "Devnet E2E tests for perp_router + MagicBlock Ephemeral Rollup",
   "scripts": {
     "test": "mocha --require ts-node/register --timeout 300000 perp_router_er.ts",
-    "test:direct": "mocha --require ts-node/register --timeout 180000 perp_router_direct.ts"
+    "test:direct": "mocha --require ts-node/register --timeout 180000 perp_router_direct.ts",
+    "test:matching": "mocha --require ts-node/register --timeout 300000 perp_router_matching.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "^0.32.1",

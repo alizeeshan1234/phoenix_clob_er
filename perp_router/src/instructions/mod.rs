@@ -1,6 +1,7 @@
 //! Instruction processors. One file per instruction; each exposes
 //! `pub fn process(program_id, accounts, data) -> ProgramResult`.
 
+pub mod cancel_order_perp;
 pub mod claim_seat;
 pub mod close_collateral_deposit_receipt;
 pub mod close_position;

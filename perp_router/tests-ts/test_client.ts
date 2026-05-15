@@ -82,6 +82,7 @@ export const TAG = {
   DelegateOrderbook: 25,
   ClaimSeat: 26,
   PlaceOrderPerp: 27,
+  CancelOrderPerp: 28,
 } as const;
 
 // PDA seed prefixes (matches perp_router/src/constants.rs).
@@ -429,7 +430,13 @@ export class PerpTestClient {
 
   /**
    * Push a limit order into the in-tree Phoenix matching engine on the
-   * delegated orderbook. `side`: 0=Bid, 1=Ask. Runs on ER.
+   * delegated orderbook, locking margin from the trader's collateral.
+   * `side`: 0=Bid, 1=Ask. Runs on ER.
+   *
+   * `makerTraderAccounts` — TraderAccount PDAs of any makers the order
+   * is expected to cross. Required when the order will fill against
+   * resting liquidity (the program looks them up by pubkey to apply
+   * maker-side bookkeeping). Pass `[]` for orders that only rest.
    */
   async placeOrderPerp(
     trader: Keypair,
@@ -438,8 +445,10 @@ export class PerpTestClient {
     priceInTicks: BN,
     numBaseLots: BN,
     clientOrderId: BN = new BN(0),
+    makerTraderAccounts: PublicKey[] = [],
   ): Promise<string> {
     const [orderbook] = this.orderbookPda(perpMarket);
+    const [traderAccount] = this.traderAccountPda(trader.publicKey);
     const data = Buffer.concat([
       u8(TAG.PlaceOrderPerp),
       u8(side),
@@ -447,16 +456,44 @@ export class PerpTestClient {
       u64(numBaseLots),
       u128(clientOrderId),
     ]);
+    const keys: AccountMeta[] = [
+      { pubkey: trader.publicKey, isSigner: true, isWritable: false },
+      { pubkey: traderAccount, isSigner: false, isWritable: true },
+      { pubkey: perpMarket, isSigner: false, isWritable: false },
+      { pubkey: orderbook, isSigner: false, isWritable: true },
+    ];
+    for (const m of makerTraderAccounts) {
+      keys.push({ pubkey: m, isSigner: false, isWritable: true });
+    }
+    const ix = new TransactionInstruction({
+      programId: PERP_ROUTER_PROGRAM_ID,
+      keys,
+      data,
+    });
+    return this.sendEr([ix], trader === this.payer ? [] : [trader], "placeOrderPerp");
+  }
+
+  /**
+   * Cancel all of the trader's resting orders on the orderbook and
+   * release their locked margin back to free collateral. Runs on ER.
+   */
+  async cancelOrderPerp(
+    trader: Keypair,
+    perpMarket: PublicKey,
+  ): Promise<string> {
+    const [orderbook] = this.orderbookPda(perpMarket);
+    const [traderAccount] = this.traderAccountPda(trader.publicKey);
     const ix = new TransactionInstruction({
       programId: PERP_ROUTER_PROGRAM_ID,
       keys: [
         { pubkey: trader.publicKey, isSigner: true, isWritable: false },
+        { pubkey: traderAccount, isSigner: false, isWritable: true },
         { pubkey: perpMarket, isSigner: false, isWritable: false },
         { pubkey: orderbook, isSigner: false, isWritable: true },
       ],
-      data,
+      data: Buffer.from([TAG.CancelOrderPerp]),
     });
-    return this.sendEr([ix], trader === this.payer ? [] : [trader], "placeOrderPerp");
+    return this.sendEr([ix], trader === this.payer ? [] : [trader], "cancelOrderPerp");
   }
 
   /**
@@ -1099,6 +1136,45 @@ export class PerpTestClient {
     if (!a) return new BN(0);
     // Pubkey(32) + collateral(8) → pnl_matured u64
     return new BN(a.data.subarray(40, 48), "le");
+  }
+
+  /** Parse TraderAccount.locked_margin (u64 LE) at field offset 48. */
+  async getTraderLockedMargin(owner: PublicKey): Promise<BN> {
+    const [pda] = this.traderAccountPda(owner);
+    const a = await this.getLiveAccount(pda);
+    if (!a) return new BN(0);
+    // Pubkey(32) + collateral(8) + pnl_matured(8) → locked_margin u64
+    return new BN(a.data.subarray(48, 56), "le");
+  }
+
+  /**
+   * Parse the trader's first Position entry. Layout (offsets within
+   * TraderAccount):
+   *   320: positions[] start (Position is 80 bytes: market 32 + size_stored
+   *        i64 8 + entry_price u64 8 + margin_locked u64 8 + entry_funding_index
+   *        i128 16 + last_epoch_seen u64 8)
+   *   320 + 80·8 = 960: positions_len u8
+   * Reads slot 0 only. Returns null if positions_len == 0.
+   */
+  async getTraderPosition0(owner: PublicKey): Promise<
+    { market: PublicKey; size_stored: BN; entry_price: BN; margin_locked: BN } | null
+  > {
+    const [pda] = this.traderAccountPda(owner);
+    const a = await this.getLiveAccount(pda);
+    if (!a) return null;
+    const positionsLen = a.data[960];
+    if (positionsLen === 0) return null;
+    const off = 320;
+    const market = new PublicKey(a.data.subarray(off, off + 32));
+    // size_stored is signed i64. Reconvert via two's complement.
+    const sizeRaw = new BN(a.data.subarray(off + 32, off + 40), "le");
+    const sizeSigned = sizeRaw.testn(63) ? sizeRaw.fromTwos(64) : sizeRaw;
+    return {
+      market,
+      size_stored: sizeSigned,
+      entry_price: new BN(a.data.subarray(off + 40, off + 48), "le"),
+      margin_locked: new BN(a.data.subarray(off + 48, off + 56), "le"),
+    };
   }
 
   /**

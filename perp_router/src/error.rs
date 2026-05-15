@@ -41,6 +41,10 @@ pub enum PerpRouterError {
     SeatTableFull,
     #[error("Matching engine rejected order")]
     OrderRejected,
+    #[error("Maker TraderAccount missing from remaining accounts")]
+    MakerAccountMissing,
+    #[error("More fill events than this ix can settle (cap exceeded)")]
+    TooManyFills,
 }
 
 impl From<PerpRouterError> for ProgramError {

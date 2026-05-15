@@ -167,34 +167,6 @@ describe("perp-router-er (devnet, ER trading)", () => {
     }
   });
 
-  it("3b. (ER) ClaimSeat — register trader in orderbook", async () => {
-    const sig = await tc.claimSeat(trader, perpMarketPda);
-    console.log("    claim seat:   ", sig);
-  });
-
-  it("3c. (ER) PlaceOrderPerp — post a Bid limit, matching engine fires", async () => {
-    // Bid @ 100 ticks for 10 base lots. With an empty book the order
-    // posts as resting liquidity — proves the in-tree matching engine
-    // ran and mutated PerpOrderbook on the ER.
-    const sig = await tc.placeOrderPerp(
-      trader,
-      perpMarketPda,
-      0, // Side::Bid
-      new BN(100),
-      new BN(10),
-      new BN(1),
-    );
-    console.log("    place order: ", sig);
-    // Sanity: orderbook still exists at the expected size and is
-    // delegation-owned on base (i.e. live state lives on ER).
-    const obInfo = await tc.baseConnection.getAccountInfo(orderbookPda);
-    assert(obInfo, "orderbook still exists on base");
-    assert(
-      obInfo!.owner.equals(DELEGATION_PROGRAM_ID),
-      `orderbook owner = ${obInfo!.owner.toBase58()}, expected delegation program`,
-    );
-  });
-
   it("4. magic deposit — request (base) + process (ER) credits 200 USDC", async () => {
     // Stage 1 (base): SPL transfer trader→vault, create DepositReceipt,
     // delegate receipt + queue ProcessCollateralDepositEr.
@@ -241,6 +213,48 @@ describe("perp-router-er (devnet, ER trading)", () => {
     }
     console.log("    collateral:    ", c.toString());
     assert(c.eq(new BN(200_000_000)));
+  });
+
+  it("4b. (ER) ClaimSeat — register trader in orderbook", async () => {
+    const sig = await tc.claimSeat(trader, perpMarketPda);
+    console.log("    claim seat:   ", sig);
+  });
+
+  it("4c. (ER) PlaceOrderPerp — Bid 100×10, matching engine fires + margin locked", async () => {
+    const before = await tc.getTraderLockedMargin(trader.publicKey);
+    const sig = await tc.placeOrderPerp(
+      trader,
+      perpMarketPda,
+      0, // Side::Bid
+      new BN(100),
+      new BN(10),
+      new BN(1),
+    );
+    console.log("    place order: ", sig);
+    const after = await tc.getTraderLockedMargin(trader.publicKey);
+    const delta = after.sub(before);
+    console.log("    locked_margin delta:", delta.toString());
+    // notional = 100 × 10 = 1000 quote lots; max_leverage_bps default
+    // is 100_000 (10x) → expected margin = 1000 × 10_000 / 100_000 = 100.
+    assert(
+      delta.eq(new BN(100)),
+      `expected locked_margin delta = 100, got ${delta.toString()}`,
+    );
+    // Sanity: orderbook is delegation-owned on base (live state on ER).
+    const obInfo = await tc.baseConnection.getAccountInfo(orderbookPda);
+    assert(obInfo, "orderbook still exists on base");
+    assert(
+      obInfo!.owner.equals(DELEGATION_PROGRAM_ID),
+      `orderbook owner = ${obInfo!.owner.toBase58()}, expected delegation program`,
+    );
+  });
+
+  it("4d. (ER) CancelOrderPerp — drains the book, releases locked_margin", async () => {
+    const sig = await tc.cancelOrderPerp(trader, perpMarketPda);
+    console.log("    cancel order:", sig);
+    const lm = await tc.getTraderLockedMargin(trader.publicKey);
+    console.log("    locked_margin:", lm.toString());
+    assert(lm.eqn(0), `locked_margin must be 0 after cancel, got ${lm.toString()}`);
   });
 
   it("5. (ER) DirectOpenPosition — long 1 @ $100, $50 margin (2x)", async () => {

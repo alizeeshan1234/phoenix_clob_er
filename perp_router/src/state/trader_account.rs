@@ -54,6 +54,13 @@ pub struct TraderAccount {
     /// Matured PnL — withdrawable, subject to haircut.
     pub pnl_matured: u64,
 
+    /// Aggregate margin locked behind resting orders on the in-tree
+    /// orderbook. Bumped on `PlaceOrderPerp` when an order posts and
+    /// drained on `CancelOrderPerp`. Withdrawable collateral is
+    /// `collateral - locked_margin` (the matching engine and risk
+    /// checks both treat `locked_margin` as encumbered).
+    pub locked_margin: u64,
+
     /// Pending PnL entries awaiting warmup.
     pub pnl_reserve: [ReserveEntry; MAX_RESERVE_ENTRIES],
     pub pnl_reserve_len: u8,

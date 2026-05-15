@@ -108,6 +108,7 @@ pub enum PerpRouterInstruction {
     DelegateOrderbook = 25,
     ClaimSeat = 26,
     PlaceOrderPerp = 27,
+    CancelOrderPerp = 28,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -221,6 +222,9 @@ pub fn process_instruction(
         }
         PerpRouterInstruction::PlaceOrderPerp => {
             instructions::place_order_perp::process(program_id, accounts, data)
+        }
+        PerpRouterInstruction::CancelOrderPerp => {
+            instructions::cancel_order_perp::process(program_id, accounts, data)
         }
     }
 }
