@@ -42,7 +42,7 @@ describe("perp-router-er (devnet, ER trading)", () => {
   let quoteMint: Keypair;
   let traderAta: PublicKey;
   let perpMarketPda: PublicKey;
-  let orderbookPubkey: PublicKey;
+  let orderbookPda: PublicKey;
 
   before(async () => {
     console.log("Program ID:    ", PERP_ROUTER_PROGRAM_ID.toBase58());
@@ -103,21 +103,23 @@ describe("perp-router-er (devnet, ER trading)", () => {
     console.log("    init market:  ", s2);
     console.log("    init trader:  ", s3);
 
-    // Orderbook: in-process phoenix FIFOMarket<Pubkey, 512, 512, 128>,
-    // ~82 KB. Keypair-allocated by the client (CPI'd create_account caps
-    // at 10 KB), assigned to perp_router, then initialised in the same tx.
-    const PERP_ORDERBOOK_SIZE = 84_368;
+    // Orderbook: in-process phoenix FIFOMarket<Pubkey, 32, 32, 32>,
+    // 9,104 bytes. PDA seeded by perp_market — fits under the 10 KB
+    // single-CPI alloc cap, so perp_router signs the create_account
+    // itself. The shape is constrained: 32×32×32 is the largest one that
+    // is both PDA-allocatable in one CPI and delegatable to MagicBlock
+    // ER. See state/orderbook.rs + the sweep test for why.
+    const PERP_ORDERBOOK_SIZE = 9_104;
     const { orderbook, sig: s4 } = await tc.initializeOrderbook(
       perpMarketPda,
       new BN(1),
       new BN(1),
       0,
-      PERP_ORDERBOOK_SIZE,
     );
-    orderbookPubkey = orderbook.publicKey;
+    orderbookPda = orderbook;
     console.log("    init orderbook:", s4);
-    console.log("    orderbook key: ", orderbook.publicKey.toBase58());
-    const obInfo = await tc.baseConnection.getAccountInfo(orderbook.publicKey);
+    console.log("    orderbook pda: ", orderbook.toBase58());
+    const obInfo = await tc.baseConnection.getAccountInfo(orderbook);
     assert(obInfo, "orderbook account must exist after init");
     assert(
       obInfo!.owner.equals(PERP_ROUTER_PROGRAM_ID),
@@ -130,7 +132,7 @@ describe("perp-router-er (devnet, ER trading)", () => {
     console.log("    orderbook size:", obInfo!.data.length, "bytes");
   });
 
-  it("3. (base) delegate GlobalState + PerpMarket + TraderAccount to ER", async () => {
+  it("3. (base) delegate GlobalState + PerpMarket + TraderAccount + Orderbook to ER", async () => {
     // Idempotent: skip any account that's already delegation-program-owned
     // on base (carry-over from a prior run). Step 9 leaves them undelegated
     // when it succeeds, but we don't want a failed cleanup to block reruns.
@@ -153,6 +155,44 @@ describe("perp-router-er (devnet, ER trading)", () => {
       const sig = await tc.delegateAccount(tag, pda, signer, aux.buffer, aux.record, aux.metadata);
       console.log(`    delegate ${label}: `, sig);
     }
+
+    // Orderbook delegation uses its own account list (perp_market is
+    // needed server-side to derive the bump), so it goes through the
+    // dedicated builder rather than the generic delegateAccount.
+    if (await delegated(orderbookPda)) {
+      console.log("    orderbook already delegated, skipping");
+    } else {
+      const sig = await tc.delegateOrderbook(perpMarketPda);
+      console.log("    delegate orderbook:", sig);
+    }
+  });
+
+  it("3b. (ER) ClaimSeat — register trader in orderbook", async () => {
+    const sig = await tc.claimSeat(trader, perpMarketPda);
+    console.log("    claim seat:   ", sig);
+  });
+
+  it("3c. (ER) PlaceOrderPerp — post a Bid limit, matching engine fires", async () => {
+    // Bid @ 100 ticks for 10 base lots. With an empty book the order
+    // posts as resting liquidity — proves the in-tree matching engine
+    // ran and mutated PerpOrderbook on the ER.
+    const sig = await tc.placeOrderPerp(
+      trader,
+      perpMarketPda,
+      0, // Side::Bid
+      new BN(100),
+      new BN(10),
+      new BN(1),
+    );
+    console.log("    place order: ", sig);
+    // Sanity: orderbook still exists at the expected size and is
+    // delegation-owned on base (i.e. live state lives on ER).
+    const obInfo = await tc.baseConnection.getAccountInfo(orderbookPda);
+    assert(obInfo, "orderbook still exists on base");
+    assert(
+      obInfo!.owner.equals(DELEGATION_PROGRAM_ID),
+      `orderbook owner = ${obInfo!.owner.toBase58()}, expected delegation program`,
+    );
   });
 
   it("4. magic deposit — request (base) + process (ER) credits 200 USDC", async () => {

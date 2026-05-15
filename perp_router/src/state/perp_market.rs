@@ -40,7 +40,10 @@ pub struct PerpMarket {
 
     pub authority: Pubkey,
     pub bump: u8,
-    pub _pad: [u8; 7],
+    /// Bump for the per-market orderbook PDA (`[b"orderbook", perp_market]`).
+    /// Set by `InitializeOrderbook`. Zero until that ix runs.
+    pub orderbook_bump: u8,
+    pub _pad: [u8; 6],
 }
 
 impl PerpMarket {

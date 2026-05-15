@@ -1,21 +1,20 @@
 //! InitializeOrderbook — base layer, admin-only.
 //!
-//! Zero-inits a Phoenix `FIFOMarket<Pubkey, 512, 512, 128>` layout in the
-//! provided `orderbook` account. The matching engine runs **in-process**
-//! (perp_router pulls phoenix-v1 in as a `no-entrypoint` lib) — there is
-//! no CPI to a separately deployed Phoenix program.
-//!
-//! The orderbook is ~82 KB, which is larger than Solana's 10 KB CPI
-//! allocation cap (MAX_PERMITTED_DATA_INCREASE). The client therefore
-//! pre-allocates the account at full size via a top-level
-//! `system_instruction::create_account` (no CPI) using a fresh keypair
-//! and assigns it to `perp_router` before this ix runs. This ix only
-//! does the data-layout setup.
+//! Allocates the per-market orderbook PDA at the small `(32, 32, 32)`
+//! `FIFOMarket` shape (~9 KB), then runs the in-tree Phoenix matching
+//! engine's `initialize_with_params` + `set_fee` on it. The size fits
+//! under Solana's single-CPI alloc cap (10,240 bytes), so allocation is
+//! one `invoke_signed` here — no client-side pre-allocation, no chunked
+//! realloc. That shape is the largest one that's both PDA-allocatable
+//! *and* delegatable to MagicBlock ER, which is where matching has to run
+//! once trading goes live (see the `sweep_shapes_vs_cpi_cap` test in
+//! `state/orderbook.rs`).
 //!
 //! Account list:
-//!   [0] admin           (signer; gates initialisation)
-//!   [1] perp_market     (readonly; context check — must be perp_router-owned)
-//!   [2] orderbook       (writable; pre-allocated, perp_router-owned, zero-data)
+//!   [0] admin           (signer, writable, payer)
+//!   [1] system_program
+//!   [2] perp_market     (writable; orderbook_bump stored back into it)
+//!   [3] orderbook       (writable; system-owned uninit PDA — created here)
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use phoenix::{
@@ -28,12 +27,18 @@ use solana_program::{
     entrypoint::ProgramResult,
     program_error::ProgramError,
     pubkey::Pubkey,
+    rent::Rent,
+    system_program,
+    sysvar::Sysvar,
 };
+use std::mem::size_of;
 
 use crate::{
+    constants::ORDERBOOK_SEED,
     error::{assert_with_msg, PerpRouterError},
-    state::{PerpOrderbook, PERP_ORDERBOOK_SIZE},
-    validation::loaders::find_perp_market_address,
+    state::{PerpMarket, PerpOrderbook, PERP_ORDERBOOK_SIZE},
+    system_utils::create_account,
+    validation::loaders::{find_orderbook_address, find_perp_market_address},
 };
 
 #[derive(BorshSerialize, BorshDeserialize)]
@@ -61,6 +66,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     let it = &mut accounts.iter();
     let admin = next_account_info(it)?;
+    let system_program_info = next_account_info(it)?;
     let perp_market_info = next_account_info(it)?;
     let orderbook_info = next_account_info(it)?;
 
@@ -69,11 +75,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         ProgramError::MissingRequiredSignature,
         "admin must sign InitializeOrderbook",
     )?;
+    assert_with_msg(
+        system_program_info.key == &system_program::ID,
+        ProgramError::IncorrectProgramId,
+        "system_program mismatch",
+    )?;
 
-    // perp_market PDA + ownership check.
+    // perp_market PDA + ownership + authority check.
     {
-        use crate::state::PerpMarket;
-        use std::mem::size_of;
         let buf = perp_market_info.try_borrow_data()?;
         let m = bytemuck::from_bytes::<PerpMarket>(&buf[..size_of::<PerpMarket>()]);
         let (expected, _) = find_perp_market_address(&m.phoenix_market, program_id);
@@ -82,6 +91,16 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             PerpRouterError::InvalidPda,
             "perp_market PDA mismatch",
         )?;
+        assert_with_msg(
+            &m.authority == admin.key,
+            PerpRouterError::InvalidAuthority,
+            "Caller is not the recorded PerpMarket.authority",
+        )?;
+        assert_with_msg(
+            m.orderbook_bump == 0,
+            PerpRouterError::AlreadyInitialized,
+            "Orderbook already initialised for this perp_market",
+        )?;
     }
     assert_with_msg(
         perp_market_info.owner == &crate::ID,
@@ -89,22 +108,40 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         "perp_market must be perp_router-owned",
     )?;
 
-    // Orderbook must already exist at full size, owned by perp_router,
-    // with zero-initialised data (FIFOMarket initialise asserts the
-    // base_lots/sequence_number fields are zero).
+    // Orderbook PDA derivation + uninit check.
+    let (expected_orderbook, orderbook_bump) =
+        find_orderbook_address(perp_market_info.key, program_id);
     assert_with_msg(
-        orderbook_info.owner == &crate::ID,
-        ProgramError::IllegalOwner,
-        "orderbook must be perp_router-owned (pre-allocated by client)",
+        &expected_orderbook == orderbook_info.key,
+        PerpRouterError::InvalidPda,
+        "orderbook PDA mismatch",
     )?;
     assert_with_msg(
-        orderbook_info.data_len() == PERP_ORDERBOOK_SIZE,
-        ProgramError::InvalidAccountData,
-        "orderbook data length must equal PERP_ORDERBOOK_SIZE",
+        orderbook_info.owner == &system_program::ID && orderbook_info.data_is_empty(),
+        PerpRouterError::AlreadyInitialized,
+        "orderbook already initialised",
     )?;
 
-    // Cast the fresh bytes to a `FIFOMarket` and run phoenix's matching
-    // engine initialisation in-process.
+    // Single-CPI allocate + assign, signed with the orderbook PDA seeds.
+    let perp_market_key = *perp_market_info.key;
+    let rent = Rent::get()?;
+    let seeds: Vec<Vec<u8>> = vec![
+        ORDERBOOK_SEED.to_vec(),
+        perp_market_key.as_ref().to_vec(),
+        vec![orderbook_bump],
+    ];
+    create_account(
+        admin,
+        orderbook_info,
+        system_program_info,
+        program_id,
+        &rent,
+        PERP_ORDERBOOK_SIZE as u64,
+        seeds,
+    )?;
+
+    // Initialise the FIFOMarket layout in-place on the freshly-allocated
+    // (zeroed) bytes.
     {
         let mut data = orderbook_info.try_borrow_mut_data()?;
         let market = PerpOrderbook::load_mut_bytes(&mut data)
@@ -114,6 +151,14 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             BaseLotsPerBaseUnit::new(p.base_lots_per_base_unit),
         );
         market.set_fee(p.taker_fee_bps as u64);
+    }
+
+    // Persist the orderbook bump on perp_market — DelegateOrderbook reads
+    // it back to sign the delegation CPI with the correct seeds.
+    {
+        let mut buf = perp_market_info.try_borrow_mut_data()?;
+        let m = bytemuck::from_bytes_mut::<PerpMarket>(&mut buf[..size_of::<PerpMarket>()]);
+        m.orderbook_bump = orderbook_bump;
     }
 
     Ok(())

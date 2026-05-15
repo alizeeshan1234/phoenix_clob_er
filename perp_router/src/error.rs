@@ -37,6 +37,10 @@ pub enum PerpRouterError {
     MathOverflow,
     #[error("Too many open positions")]
     PositionTableFull,
+    #[error("Orderbook seat table is full")]
+    SeatTableFull,
+    #[error("Matching engine rejected order")]
+    OrderRejected,
 }
 
 impl From<PerpRouterError> for ProgramError {

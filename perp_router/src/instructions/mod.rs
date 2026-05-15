@@ -1,10 +1,12 @@
 //! Instruction processors. One file per instruction; each exposes
 //! `pub fn process(program_id, accounts, data) -> ProgramResult`.
 
+pub mod claim_seat;
 pub mod close_collateral_deposit_receipt;
 pub mod close_position;
 pub mod crank_funding;
 pub mod delegate_global_state;
+pub mod delegate_orderbook;
 pub mod delegate_perp_market;
 pub mod delegate_trader_account;
 pub mod direct_close_position;
@@ -19,6 +21,7 @@ pub mod initialize_trader;
 pub mod liquidate;
 pub mod mature_pnl;
 pub mod open_position;
+pub mod place_order_perp;
 pub mod process_collateral_deposit_er;
 pub mod process_collateral_withdrawal_er;
 pub mod recovery_check;

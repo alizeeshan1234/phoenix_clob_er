@@ -31,6 +31,7 @@ pub const PERP_MARKET_SEED: &[u8] = b"perp_market";
 pub const TRADER_ACCOUNT_SEED: &[u8] = b"trader_account";
 pub const DEPOSIT_RECEIPT_SEED: &[u8] = b"perp_deposit_receipt";
 pub const WITHDRAWAL_RECEIPT_SEED: &[u8] = b"perp_withdrawal_receipt";
+pub const ORDERBOOK_SEED: &[u8] = b"orderbook";
 
 /// Singleton PDA that acts as:
 ///   1. The SPL token owner for all collateral / base / quote vaults

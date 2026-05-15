@@ -36,7 +36,7 @@ import BN from "bn.js";
 
 export const PERP_ROUTER_PROGRAM_ID = new PublicKey(
   process.env.PERP_ROUTER_PROGRAM_ID ||
-    "PerpRoutr1111111111111111111111111111111111",
+    "A1eqsa75nTvgBpN6NKxQceXop1gjwi8fZc12SgBgLFDz",
 );
 export const PHOENIX_PROGRAM_ID = new PublicKey(
   process.env.PHOENIX_PROGRAM_ID ||
@@ -79,6 +79,9 @@ export const TAG = {
   DirectOpenPosition: 22,
   DirectClosePosition: 23,
   InitializeOrderbook: 24,
+  DelegateOrderbook: 25,
+  ClaimSeat: 26,
+  PlaceOrderPerp: 27,
 } as const;
 
 // PDA seed prefixes (matches perp_router/src/constants.rs).
@@ -88,6 +91,7 @@ const TRADER_ACCOUNT_SEED = Buffer.from("trader_account");
 const PERP_AUTHORITY_SEED = Buffer.from("perp_authority");
 const DEPOSIT_RECEIPT_SEED = Buffer.from("perp_deposit_receipt");
 const WITHDRAWAL_RECEIPT_SEED = Buffer.from("perp_withdrawal_receipt");
+const ORDERBOOK_SEED = Buffer.from("orderbook");
 
 const u64 = (n: number | bigint | BN) => {
   const b = BN.isBN(n) ? n : new BN(n.toString());
@@ -201,6 +205,13 @@ export class PerpTestClient {
   withdrawalReceiptPda(trader: PublicKey): [PublicKey, number] {
     return PublicKey.findProgramAddressSync(
       [WITHDRAWAL_RECEIPT_SEED, trader.toBuffer()],
+      PERP_ROUTER_PROGRAM_ID,
+    );
+  }
+  /** Per-market orderbook PDA — `[b"orderbook", perp_market]`. */
+  orderbookPda(perpMarket: PublicKey): [PublicKey, number] {
+    return PublicKey.findProgramAddressSync(
+      [ORDERBOOK_SEED, perpMarket.toBuffer()],
       PERP_ROUTER_PROGRAM_ID,
     );
   }
@@ -361,46 +372,125 @@ export class PerpTestClient {
   }
 
   /**
-   * Two-ix tx: client allocates the ~82 KB orderbook account at full size
-   * (top-level SystemProgram.createAccount; CPI'd allocations cap at 10 KB)
-   * + perp_router::initialize_orderbook to write the FIFOMarket layout.
-   * Returns the fresh orderbook keypair so the caller can reference it.
+   * Allocates the orderbook PDA (`[b"orderbook", perp_market]`) and runs
+   * `FIFOMarket::initialize_with_params` + `set_fee` on it. The PDA layout
+   * (9,104 bytes for the 32×32×32 FIFOMarket shape) fits under the 10 KB
+   * single-CPI alloc cap, so this is one ix — the program itself signs the
+   * `create_account` with the orderbook seeds. Returns the derived PDA.
    */
   async initializeOrderbook(
     perpMarket: PublicKey,
     tickSizeInQuoteLotsPerBaseUnit: BN,
     baseLotsPerBaseUnit: BN,
     takerFeeBps: number,
-    orderbookSize: number,
-  ): Promise<{ orderbook: Keypair; sig: string }> {
-    const orderbook = Keypair.generate();
-    const lamports = await this.baseConnection.getMinimumBalanceForRentExemption(
-      orderbookSize,
-    );
-    const createIx = SystemProgram.createAccount({
-      fromPubkey: this.payer.publicKey,
-      newAccountPubkey: orderbook.publicKey,
-      lamports,
-      space: orderbookSize,
-      programId: PERP_ROUTER_PROGRAM_ID,
-    });
+  ): Promise<{ orderbook: PublicKey; sig: string }> {
+    const [orderbook] = this.orderbookPda(perpMarket);
     const data = Buffer.concat([
       u8(TAG.InitializeOrderbook),
       u64(tickSizeInQuoteLotsPerBaseUnit),
       u64(baseLotsPerBaseUnit),
       u16(takerFeeBps),
     ]);
-    const initIx = new TransactionInstruction({
+    const ix = new TransactionInstruction({
       programId: PERP_ROUTER_PROGRAM_ID,
       keys: [
         { pubkey: this.admin.publicKey, isSigner: true, isWritable: true },
-        { pubkey: perpMarket, isSigner: false, isWritable: false },
-        { pubkey: orderbook.publicKey, isSigner: false, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: perpMarket, isSigner: false, isWritable: true },
+        { pubkey: orderbook, isSigner: false, isWritable: true },
       ],
       data,
     });
-    const sig = await this.sendBase([createIx, initIx], [orderbook], "initializeOrderbook");
+    const sig = await this.sendBase([ix], [], "initializeOrderbook");
     return { orderbook, sig };
+  }
+
+  /**
+   * Register the trader into the orderbook's inline seat RBTree. Runs on
+   * ER (orderbook is delegated). Idempotent — `get_or_register_trader`
+   * is a no-op for existing seats.
+   */
+  async claimSeat(
+    trader: Keypair,
+    perpMarket: PublicKey,
+  ): Promise<string> {
+    const [orderbook] = this.orderbookPda(perpMarket);
+    const ix = new TransactionInstruction({
+      programId: PERP_ROUTER_PROGRAM_ID,
+      keys: [
+        { pubkey: trader.publicKey, isSigner: true, isWritable: false },
+        { pubkey: perpMarket, isSigner: false, isWritable: false },
+        { pubkey: orderbook, isSigner: false, isWritable: true },
+      ],
+      data: Buffer.from([TAG.ClaimSeat]),
+    });
+    return this.sendEr([ix], trader === this.payer ? [] : [trader], "claimSeat");
+  }
+
+  /**
+   * Push a limit order into the in-tree Phoenix matching engine on the
+   * delegated orderbook. `side`: 0=Bid, 1=Ask. Runs on ER.
+   */
+  async placeOrderPerp(
+    trader: Keypair,
+    perpMarket: PublicKey,
+    side: 0 | 1,
+    priceInTicks: BN,
+    numBaseLots: BN,
+    clientOrderId: BN = new BN(0),
+  ): Promise<string> {
+    const [orderbook] = this.orderbookPda(perpMarket);
+    const data = Buffer.concat([
+      u8(TAG.PlaceOrderPerp),
+      u8(side),
+      u64(priceInTicks),
+      u64(numBaseLots),
+      u128(clientOrderId),
+    ]);
+    const ix = new TransactionInstruction({
+      programId: PERP_ROUTER_PROGRAM_ID,
+      keys: [
+        { pubkey: trader.publicKey, isSigner: true, isWritable: false },
+        { pubkey: perpMarket, isSigner: false, isWritable: false },
+        { pubkey: orderbook, isSigner: false, isWritable: true },
+      ],
+      data,
+    });
+    return this.sendEr([ix], trader === this.payer ? [] : [trader], "placeOrderPerp");
+  }
+
+  /**
+   * Hand the orderbook PDA to the MagicBlock delegation program so the
+   * in-tree matching engine can mutate it on the Ephemeral Rollup.
+   * Mirrors `delegateAccount` but with the orderbook-specific account
+   * list (perp_market is needed to derive the bump server-side).
+   */
+  async delegateOrderbook(
+    perpMarket: PublicKey,
+    validator: PublicKey | null = null,
+  ): Promise<string> {
+    const [orderbook] = this.orderbookPda(perpMarket);
+    const aux = this.delegationAuxFor(orderbook);
+    const data = Buffer.concat([
+      u8(TAG.DelegateOrderbook),
+      optionPubkey(validator),
+    ]);
+    const ix = new TransactionInstruction({
+      programId: PERP_ROUTER_PROGRAM_ID,
+      keys: [
+        { pubkey: this.admin.publicKey, isSigner: true, isWritable: true },
+        { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+        { pubkey: perpMarket, isSigner: false, isWritable: false },
+        { pubkey: orderbook, isSigner: false, isWritable: true },
+        { pubkey: PERP_ROUTER_PROGRAM_ID, isSigner: false, isWritable: false },
+        { pubkey: aux.buffer, isSigner: false, isWritable: true },
+        { pubkey: aux.record, isSigner: false, isWritable: true },
+        { pubkey: aux.metadata, isSigner: false, isWritable: true },
+        { pubkey: DELEGATION_PROGRAM_ID, isSigner: false, isWritable: false },
+      ],
+      data,
+    });
+    return this.sendBase([ix], [], "delegateOrderbook");
   }
 
   async initializeTrader(owner: Keypair): Promise<string> {

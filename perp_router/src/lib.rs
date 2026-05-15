@@ -47,7 +47,7 @@ security_txt! {
 }
 
 // Placeholder program id — replace before deploy.
-declare_id!("CYP9hmL492qupiKScaYspTjdhCfK9Xwb7uckChR9Wc2x");
+declare_id!("A1eqsa75nTvgBpN6NKxQceXop1gjwi8fZc12SgBgLFDz");
 
 /// All instructions handled by perp_router. Discriminant is the first byte of
 /// the instruction data. Order matches the 19-instruction table in the plan.
@@ -105,6 +105,9 @@ pub enum PerpRouterInstruction {
 
     // --- In-tree orderbook (vendored phoenix matching engine, no CPI) ---
     InitializeOrderbook = 24,
+    DelegateOrderbook = 25,
+    ClaimSeat = 26,
+    PlaceOrderPerp = 27,
 }
 
 #[cfg(not(feature = "no-entrypoint"))]
@@ -209,6 +212,15 @@ pub fn process_instruction(
         }
         PerpRouterInstruction::InitializeOrderbook => {
             instructions::initialize_orderbook::process(program_id, accounts, data)
+        }
+        PerpRouterInstruction::DelegateOrderbook => {
+            instructions::delegate_orderbook::process(program_id, accounts, data)
+        }
+        PerpRouterInstruction::ClaimSeat => {
+            instructions::claim_seat::process(program_id, accounts, data)
+        }
+        PerpRouterInstruction::PlaceOrderPerp => {
+            instructions::place_order_perp::process(program_id, accounts, data)
         }
     }
 }
