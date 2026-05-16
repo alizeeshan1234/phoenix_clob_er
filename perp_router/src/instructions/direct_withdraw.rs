@@ -115,7 +115,10 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             PerpRouterError::InvalidAuthority,
             "trader_account.owner != signer",
         )?;
-        let coll_req = amount.min(t.collateral);
+        // Only the *free* portion of collateral is withdrawable; see the
+        // matching gate in `process_collateral_withdrawal_er` for context.
+        let free_collateral = t.collateral.saturating_sub(t.locked_margin);
+        let coll_req = amount.min(free_collateral);
         let pnl_req = amount.saturating_sub(coll_req).min(t.pnl_matured);
         let (_, _, total) = split_withdrawal(coll_req, pnl_req, h_num, h_den)?;
         (coll_req, pnl_req, total)

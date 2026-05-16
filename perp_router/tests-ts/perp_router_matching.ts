@@ -292,7 +292,28 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     assert(bPos!.margin_locked.eqn(0), "B position margin should be 0");
   });
 
-  it("10. (ER) undelegate everything back to base — clean cleanup for rerun", async () => {
+  it("10. (ER) A posts small resting BID — locks margin to test withdraw gate", async () => {
+    // After step 9 both traders have flat positions and zero locked_margin.
+    // Re-lock a small amount on A so we can prove direct_withdraw refuses
+    // to drain it after undelegation. Notional = 100 × 5 = 500 quote lots;
+    // at 10x leverage that's 50 atoms locked.
+    const lmBefore = await tc.getTraderLockedMargin(traderA.publicKey);
+    await tc.placeOrderPerp(
+      traderA,
+      perpMarketPda,
+      0, // Bid
+      new BN(100),
+      new BN(5),
+      new BN(99),
+    );
+    const lmAfter = await tc.getTraderLockedMargin(traderA.publicKey);
+    assert(
+      lmAfter.sub(lmBefore).eqn(50),
+      `A locked_margin delta = ${lmAfter.sub(lmBefore).toString()}, expected 50`,
+    );
+  });
+
+  it("11. (ER) undelegate everything back to base — commits locked_margin", async () => {
     const [g] = tc.globalStatePda();
     for (const [label, k] of [
       ["traderA", traderAAccountPda],
@@ -307,5 +328,61 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
         console.log(`    undelegate ${label} skipped:`, String((e as any)?.message ?? e).slice(0, 80));
       }
     }
+    // Wait for commit-backs to land on base before the next step inspects
+    // base-side state.
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 1_000));
+      const info = await tc.baseConnection.getAccountInfo(traderAAccountPda);
+      if (info?.owner.equals(PERP_ROUTER_PROGRAM_ID)) {
+        console.log(`    trader A restored to base after ${i + 1}s`);
+        break;
+      }
+    }
+  });
+
+  it("12. (base) direct_withdraw must respect locked_margin gate", async () => {
+    // Verify the soundness fix: with A.collateral = 200M and locked_margin
+    // = 50, asking to withdraw the full 200M should pay only the free
+    // portion (200M - 50). Pre-fix would have drained the locked margin.
+    const lockedBefore = await tc.getTraderLockedMargin(traderA.publicKey);
+    const ataBefore = await tc.getTokenBalance(traderAAta);
+    const colBefore = await tc.getTraderCollateral(traderA.publicKey);
+
+    const sig = await tc.directWithdraw(
+      traderA,
+      quoteMint.publicKey,
+      traderAAta,
+      new BN(200_000_000),
+    );
+    console.log("    direct_withdraw:", sig);
+
+    const ataAfter = await tc.getTokenBalance(traderAAta);
+    const colAfter = await tc.getTraderCollateral(traderA.publicKey);
+    const lockedAfter = await tc.getTraderLockedMargin(traderA.publicKey);
+    const ataDelta = ataAfter.sub(ataBefore);
+    const expectedFree = colBefore.sub(lockedBefore);
+
+    console.log("    A.collateral before:", colBefore.toString());
+    console.log("    A.locked_margin:    ", lockedBefore.toString());
+    console.log("    free (expected pay):", expectedFree.toString());
+    console.log("    ATA delta:          ", ataDelta.toString());
+    console.log("    A.collateral after: ", colAfter.toString());
+
+    // No haircut when v_total_pool_value >= c_total_collateral + matured
+    // (pool is healthy). Net payout equals coll_req exactly.
+    assert(
+      ataDelta.eq(expectedFree),
+      `ATA delta = ${ataDelta.toString()}, expected ${expectedFree.toString()}`,
+    );
+    // locked_margin remains untouched — that's the point.
+    assert(
+      lockedAfter.eq(lockedBefore),
+      `locked_margin should not change, got ${lockedAfter.toString()}`,
+    );
+    // Trader.collateral reduced by exactly what was paid out.
+    assert(
+      colBefore.sub(colAfter).eq(expectedFree),
+      `collateral Δ = ${colBefore.sub(colAfter).toString()}, expected ${expectedFree.toString()}`,
+    );
   });
 });

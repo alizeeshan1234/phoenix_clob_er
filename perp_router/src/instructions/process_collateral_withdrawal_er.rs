@@ -157,7 +157,16 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], _data: &[u8]) -> P
     let (collateral_request, pnl_request, net_amount) = {
         let buf = trader_account_info.try_borrow_data()?;
         let t = bytemuck::from_bytes::<TraderAccount>(&buf[..size_of::<TraderAccount>()]);
-        let coll_req = gross_amount.min(t.collateral);
+        // Only the *free* portion of collateral is withdrawable. Margin
+        // backing resting orders on the in-tree orderbook (`locked_margin`)
+        // and margin backing open positions (`positions[i].margin_locked`)
+        // must stay encumbered until the orders cancel / positions close.
+        // Without this gate a trader could place a resting order with
+        // their entire balance and then drain the same balance via
+        // withdraw — the engine would still settle the order as if the
+        // collateral were there.
+        let free_collateral = t.collateral.saturating_sub(t.locked_margin);
+        let coll_req = gross_amount.min(free_collateral);
         let pnl_req = gross_amount.saturating_sub(coll_req).min(t.pnl_matured);
         let (c_pay, p_pay, total) = split_withdrawal(coll_req, pnl_req, h_num, h_den)?;
         let _ = c_pay; // == coll_req
