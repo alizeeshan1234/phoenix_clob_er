@@ -277,41 +277,14 @@ describe("perp-router-er (devnet, ER trading)", () => {
     assert(lm.eqn(0), `locked_margin must be 0 after cancel, got ${lm.toString()}`);
   });
 
-  it("5. (ER) DirectOpenPosition — long 1 @ $100, $50 margin (2x)", async () => {
-    const sig = await tc.directOpenPosition(
-      trader,
-      PHOENIX_MARKET,
-      new BN(1),
-      new BN(100_000_000),
-      new BN(50_000_000),
-      true,
-    );
-    console.log("    open (ER):    ", sig);
-  });
+  // Steps 5 (DirectOpenPosition), 6 (DirectClosePosition), and 7
+  // (MaturePnl) were dropped when the legacy oracle-priced synthetic
+  // open/close instructions were retired. Matched-flow open/close + PnL
+  // realization is covered by perp_router_matching.ts; this spec now
+  // exercises only the deposit / orderbook lock+cancel / withdraw /
+  // undelegate lifecycle.
 
-  it("6. (ER) DirectClosePosition @ $102 — gain to reserve", async () => {
-    const sig = await tc.directClosePosition(
-      trader,
-      PHOENIX_MARKET,
-      new BN(102_000_000),
-      true,
-    );
-    console.log("    close (ER):   ", sig);
-  });
-
-  it("7. (ER) MaturePnl — sweep reserve to matured after warmup", async () => {
-    // WARMUP_SLOTS = 150 ≈ ~60s on devnet (slot time ~400ms). Pad to
-    // ensure the slot has advanced past mature_slot.
-    console.log("    waiting 75s for warmup slots to elapse...");
-    await new Promise((r) => setTimeout(r, 75_000));
-    const sig = await tc.maturePnl(trader);
-    console.log("    mature (ER): ", sig);
-    const m = await tc.getTraderPnlMatured(trader.publicKey);
-    console.log("    pnl_matured:  ", m.toString());
-    assert(m.gt(new BN(0)), "pnl_matured must be > 0 after maturePnl");
-  });
-
-  it("8. magic withdraw — request (base) + auto-fired process + execute", async () => {
+  it("5. magic withdraw — request (base) + auto-fired process + execute", async () => {
     const beforeAta = await tc.getTokenBalance(traderAta);
     const [w] = tc.withdrawalReceiptPda(trader.publicKey);
     const auxW = tc.delegationAuxFor(w);
@@ -335,7 +308,7 @@ describe("perp-router-er (devnet, ER trading)", () => {
     assert(delta.gt(new BN(0)), "trader ATA must increase after withdraw");
   });
 
-  it("9. (ER) Undelegate trader + global + market — return to base", async () => {
+  it("6. (ER) Undelegate trader + global + market — return to base", async () => {
     const [t] = tc.traderAccountPda(trader.publicKey);
     const [g] = tc.globalStatePda();
     // Use wallet (= feepayer) as signer for all three. The undelegate
@@ -372,9 +345,10 @@ describe("perp-router-er (devnet, ER trading)", () => {
     }
   });
 
-  it("10. summary — full ER round-trip complete", async () => {
-    console.log("\n   ✓ Full Percolator + ER round-trip on devnet:");
-    console.log("   ✓ deposit → delegate → open → close → mature → withdraw → undelegate");
+  it("7. summary — full ER lifecycle complete", async () => {
+    console.log("\n   ✓ Percolator + ER lifecycle on devnet:");
+    console.log("   ✓ deposit → delegate → place/cancel → withdraw → undelegate");
+    console.log("   ✓ (open/close + PnL covered by perp_router_matching.ts)");
     console.log("   ✓ Verify on https://explorer.solana.com/?cluster=devnet");
   });
 });

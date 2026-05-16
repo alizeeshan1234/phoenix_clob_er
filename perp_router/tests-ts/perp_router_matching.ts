@@ -313,6 +313,26 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     assert.equal(bLenBefore - bLenAfter, 1, "B.positions_len should decrement by 1");
   });
 
+  it("9b. (ER) MaturePnl on wallet — sweeps the +50 close profit reserve→matured", async () => {
+    // Step 9 pushed +50 into wallet's pnl_reserve with mature_slot =
+    // current_slot + WARMUP_SLOTS (150 slots ≈ 60s on devnet at ~400ms
+    // per slot). After the wait, MaturePnl should sweep it into
+    // pnl_matured. Existing pnl_matured may carry across runs; assert a
+    // ≥ 50 delta rather than equality.
+    const before = await tc.getTraderPnlMatured(wallet.publicKey);
+    console.log("    waiting 75s for warmup slots to elapse...");
+    await new Promise((r) => setTimeout(r, 75_000));
+    const sig = await tc.maturePnl(wallet);
+    console.log("    mature (ER):", sig);
+    const after = await tc.getTraderPnlMatured(wallet.publicKey);
+    const delta = after.sub(before);
+    console.log("    pnl_matured:", before.toString(), "→", after.toString(), `(Δ ${delta.toString()})`);
+    assert(
+      delta.gte(new BN(50)),
+      `pnl_matured delta should be ≥ 50, got ${delta.toString()}`,
+    );
+  });
+
   it("10. (ER) A posts small resting BID — locks margin to test withdraw gate", async () => {
     // After step 9 both traders have flat positions and zero locked_margin.
     // Re-lock a small amount on A so we can prove direct_withdraw refuses

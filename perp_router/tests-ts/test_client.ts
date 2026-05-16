@@ -76,8 +76,7 @@ export const TAG = {
   InitializeGlobalState: 19,
   DirectDeposit: 20,
   DirectWithdraw: 21,
-  DirectOpenPosition: 22,
-  DirectClosePosition: 23,
+  // 22, 23 are retired (formerly DirectOpenPosition / DirectClosePosition).
   InitializeOrderbook: 24,
   DelegateOrderbook: 25,
   ClaimSeat: 26,
@@ -1005,74 +1004,9 @@ export class PerpTestClient {
     return this.sendEr([ix], signer === this.payer ? [] : [signer], "undelegate");
   }
 
-  /** DirectOpenPosition — runs on ER when trader_account + perp_market are
-   * delegated. GlobalState is READ-ONLY in this ix, so it can stay on base
-   * (ER replicates it as a readonly clone) — that means we never need to
-   * delegate GlobalState, which keeps the test re-runnable. */
-  async directOpenPosition(
-    trader: Keypair,
-    phoenixMarket: PublicKey,
-    size: BN,
-    markPrice: BN,
-    margin: BN,
-    onEr: boolean,
-  ): Promise<string> {
-    const [traderAccount] = this.traderAccountPda(trader.publicKey);
-    const [globalState] = this.globalStatePda();
-    const [perpMarket] = this.perpMarketPda(phoenixMarket);
-    const data = Buffer.concat([
-      u8(TAG.DirectOpenPosition),
-      i64(size),
-      u64(markPrice),
-      u64(margin),
-    ]);
-    const ix = new TransactionInstruction({
-      programId: PERP_ROUTER_PROGRAM_ID,
-      keys: [
-        // Trader signs but is never mutated by the program. On ER the
-        // wallet isn't delegated, so writable=true is rejected as
-        // InvalidWritableAccount.
-        { pubkey: trader.publicKey, isSigner: true, isWritable: false },
-        { pubkey: traderAccount, isSigner: false, isWritable: true },
-        // GlobalState is read-only in this ix (recovery_state + a-coeff).
-        // Keeping it non-writable lets it stay un-delegated on base while
-        // the ER uses a replicated readonly clone.
-        { pubkey: globalState, isSigner: false, isWritable: false },
-        { pubkey: perpMarket, isSigner: false, isWritable: true },
-      ],
-      data,
-    });
-    const signers = trader === this.payer ? [] : [trader];
-    return onEr
-      ? this.sendEr([ix], signers, "directOpenPosition")
-      : this.sendBase([ix], signers, "directOpenPosition");
-  }
-
-  async directClosePosition(
-    trader: Keypair,
-    phoenixMarket: PublicKey,
-    markPrice: BN,
-    onEr: boolean,
-  ): Promise<string> {
-    const [traderAccount] = this.traderAccountPda(trader.publicKey);
-    const [globalState] = this.globalStatePda();
-    const [perpMarket] = this.perpMarketPda(phoenixMarket);
-    const data = Buffer.concat([u8(TAG.DirectClosePosition), u64(markPrice)]);
-    const ix = new TransactionInstruction({
-      programId: PERP_ROUTER_PROGRAM_ID,
-      keys: [
-        { pubkey: trader.publicKey, isSigner: true, isWritable: false },
-        { pubkey: traderAccount, isSigner: false, isWritable: true },
-        { pubkey: globalState, isSigner: false, isWritable: false },
-        { pubkey: perpMarket, isSigner: false, isWritable: true },
-      ],
-      data,
-    });
-    const signers = trader === this.payer ? [] : [trader];
-    return onEr
-      ? this.sendEr([ix], signers, "directClosePosition")
-      : this.sendBase([ix], signers, "directClosePosition");
-  }
+  // DirectOpenPosition / DirectClosePosition were retired in favor of
+  // the matched-flow PlaceOrderPerp + close-on-fill path. Tag 22 and 23
+  // are now intentionally unmapped on-chain.
 
   // ─── Util: spin up an SPL mint + ATA for a trader ─────────────────────
 

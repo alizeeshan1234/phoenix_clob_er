@@ -22,9 +22,10 @@
 //!         above), then open the remainder in the opposite direction
 //!         at fill_price with proportional margin.
 //!
-//! Funding accrual and Percolator side-index (A-coefficient) effects on
-//! PnL are NOT applied here — Stage 3d gap. `DirectClosePosition` still
-//! has the full risk-engine flow.
+//! Funding accrual and Percolator side-index (A-coefficient) are
+//! applied in the close/scale-up paths via `effective_size` and
+//! `position_funding_owed` (matching the now-retired `DirectClosePosition`'s
+//! risk-engine logic).
 //!
 //! Unit assumption: in v1 the orderbook is configured with
 //! `tick_size=1, base_lots_per_base_unit=1` so prices in ticks map 1:1

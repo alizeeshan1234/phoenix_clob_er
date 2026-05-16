@@ -97,11 +97,13 @@ pub enum PerpRouterInstruction {
     DirectDeposit = 20,
     DirectWithdraw = 21,
 
-    // --- Direct (oracle-priced, no Phoenix CPI) open/close. Runs on ER
-    // when accounts are delegated; on base otherwise. Used for v1.1 ER
-    // trading demos before a real Phoenix market exists on the ER. ---
-    DirectOpenPosition = 22,
-    DirectClosePosition = 23,
+    // Tags 22 (DirectOpenPosition) and 23 (DirectClosePosition) were
+    // oracle-priced synthetic open/close used as v1.1 ER trading demos
+    // before the in-tree matching engine existed. They were retired
+    // once matched-flow PlaceOrderPerp + close-on-fill PnL shipped
+    // (commits 98b3ae6 → 610e40a). The discriminants are intentionally
+    // left as gaps — TryFromPrimitive will fail with
+    // InvalidInstructionData if a client still sends them.
 
     // --- In-tree orderbook (vendored phoenix matching engine, no CPI) ---
     InitializeOrderbook = 24,
@@ -204,12 +206,6 @@ pub fn process_instruction(
         }
         PerpRouterInstruction::DirectWithdraw => {
             instructions::direct_withdraw::process(program_id, accounts, data)
-        }
-        PerpRouterInstruction::DirectOpenPosition => {
-            instructions::direct_open_position::process(program_id, accounts, data)
-        }
-        PerpRouterInstruction::DirectClosePosition => {
-            instructions::direct_close_position::process(program_id, accounts, data)
         }
         PerpRouterInstruction::InitializeOrderbook => {
             instructions::initialize_orderbook::process(program_id, accounts, data)
