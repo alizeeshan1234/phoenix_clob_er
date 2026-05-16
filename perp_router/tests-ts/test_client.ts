@@ -479,15 +479,25 @@ export class PerpTestClient {
   }
 
   /**
-   * Cancel all of the trader's resting orders on the orderbook and
-   * release their locked margin back to free collateral. Runs on ER.
+   * Cancel a single resting order by its FIFOOrderId (price_in_ticks +
+   * order_sequence_number) and release exactly the margin that backed
+   * it. The id surface is the 16-byte return data from a preceding
+   * placeOrderPerp — fetch it with `readPlaceOrderReturnData(sig)`.
+   * Runs on ER.
    */
   async cancelOrderPerp(
     trader: Keypair,
     perpMarket: PublicKey,
+    priceInTicks: BN,
+    orderSequenceNumber: BN,
   ): Promise<string> {
     const [orderbook] = this.orderbookPda(perpMarket);
     const [traderAccount] = this.traderAccountPda(trader.publicKey);
+    const data = Buffer.concat([
+      u8(TAG.CancelOrderPerp),
+      u64(priceInTicks),
+      u64(orderSequenceNumber),
+    ]);
     const ix = new TransactionInstruction({
       programId: PERP_ROUTER_PROGRAM_ID,
       keys: [
@@ -496,9 +506,38 @@ export class PerpTestClient {
         { pubkey: perpMarket, isSigner: false, isWritable: false },
         { pubkey: orderbook, isSigner: false, isWritable: true },
       ],
-      data: Buffer.from([TAG.CancelOrderPerp]),
+      data,
     });
     return this.sendEr([ix], trader === this.payer ? [] : [trader], "cancelOrderPerp");
+  }
+
+  /**
+   * Read the resting FIFOOrderId emitted by `placeOrderPerp` via
+   * Solana return data. Returns null if the order didn't rest (fully
+   * filled or rejected) — the place ix only sets return data when
+   * something landed on the book. Connection arg lets callers point
+   * this at either the base or ER cluster.
+   */
+  async readPlaceOrderReturnData(
+    sig: string,
+    conn: Connection = this.erConnection,
+  ): Promise<{ priceInTicks: BN; orderSequenceNumber: BN } | null> {
+    const tx = await conn.getTransaction(sig, {
+      commitment: "confirmed",
+      maxSupportedTransactionVersion: 0,
+    });
+    // `returnData` exists at runtime on confirmed-tx meta but isn't in
+    // the @solana/web3.js 1.x type defs we depend on. Cast through any.
+    const rd = (tx?.meta as any)?.returnData as
+      | { programId: string; data: [string, string] }
+      | undefined;
+    if (!rd) return null;
+    const data = Buffer.from(rd.data[0], rd.data[1] as BufferEncoding);
+    if (data.length < 16) return null;
+    return {
+      priceInTicks: new BN(data.subarray(0, 8), "le"),
+      orderSequenceNumber: new BN(data.subarray(8, 16), "le"),
+    };
   }
 
   /**

@@ -220,6 +220,10 @@ describe("perp-router-er (devnet, ER trading)", () => {
     console.log("    claim seat:   ", sig);
   });
 
+  let restingOrderId:
+    | { priceInTicks: BN; orderSequenceNumber: BN }
+    | null = null;
+
   it("4c. (ER) PlaceOrderPerp — Bid 100×10, matching engine fires + margin locked", async () => {
     const before = await tc.getTraderLockedMargin(trader.publicKey);
     const sig = await tc.placeOrderPerp(
@@ -240,6 +244,16 @@ describe("perp-router-er (devnet, ER trading)", () => {
       delta.eq(new BN(100)),
       `expected locked_margin delta = 100, got ${delta.toString()}`,
     );
+    // Capture the resting FIFOOrderId via Solana return data — step 4d
+    // uses it for a per-order cancel (no longer bulk cancel-all).
+    restingOrderId = await tc.readPlaceOrderReturnData(sig);
+    assert(restingOrderId !== null, "PlaceOrderPerp should have emitted return data for the rested order");
+    console.log(
+      "    resting id:   px=",
+      restingOrderId!.priceInTicks.toString(),
+      "seq=",
+      restingOrderId!.orderSequenceNumber.toString(),
+    );
     // Sanity: orderbook is delegation-owned on base (live state on ER).
     const obInfo = await tc.baseConnection.getAccountInfo(orderbookPda);
     assert(obInfo, "orderbook still exists on base");
@@ -249,8 +263,14 @@ describe("perp-router-er (devnet, ER trading)", () => {
     );
   });
 
-  it("4d. (ER) CancelOrderPerp — drains the book, releases locked_margin", async () => {
-    const sig = await tc.cancelOrderPerp(trader, perpMarketPda);
+  it("4d. (ER) CancelOrderPerp — cancel by id, releases that order's margin", async () => {
+    assert(restingOrderId !== null, "step 4c must have populated restingOrderId");
+    const sig = await tc.cancelOrderPerp(
+      trader,
+      perpMarketPda,
+      restingOrderId!.priceInTicks,
+      restingOrderId!.orderSequenceNumber,
+    );
     console.log("    cancel order:", sig);
     const lm = await tc.getTraderLockedMargin(trader.publicKey);
     console.log("    locked_margin:", lm.toString());

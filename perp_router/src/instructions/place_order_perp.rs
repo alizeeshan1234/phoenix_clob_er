@@ -61,6 +61,7 @@ use solana_program::{
     clock::Clock,
     entrypoint::ProgramResult,
     msg,
+    program::set_return_data,
     program_error::ProgramError,
     pubkey::Pubkey,
     sysvar::Sysvar,
@@ -71,6 +72,7 @@ use crate::{
     constants::{MAX_POSITIONS, WARMUP_SLOTS},
     error::{assert_with_msg, PerpRouterError},
     risk::{
+        margin::{quote_lots_from_base_at_price, quote_lots_to_margin},
         side_index::{effective_size, position_funding_owed},
         warmup::push_reserve,
     },
@@ -107,52 +109,6 @@ struct CapturedFill {
 enum MarginSource {
     FreeCollateral,
     LockedMargin,
-}
-
-/// Convert (base_lots, price_in_ticks) to quote_lots using the matching
-/// engine's accounting formula:
-///   quote_lots = base_lots × price_in_ticks × tick_size_in_quote_lots_per_base_unit
-///                / base_lots_per_base_unit
-/// All arithmetic in u128 so high price × size doesn't overflow before
-/// the divide. The earlier fast-path (`base_lots × price`) only worked
-/// when tick_size = base_lots_per_base_unit = 1.
-fn quote_lots_from_base_at_price(
-    base_lots: u64,
-    price_in_ticks: u64,
-    tick_size_qlpbupt: u64,
-    base_lots_per_base_unit: u64,
-) -> Result<u64, ProgramError> {
-    assert_with_msg(
-        base_lots_per_base_unit > 0,
-        ProgramError::InvalidAccountData,
-        "base_lots_per_base_unit must be > 0",
-    )?;
-    let n: u128 = (base_lots as u128)
-        .checked_mul(price_in_ticks as u128)
-        .ok_or(PerpRouterError::MathOverflow)?
-        .checked_mul(tick_size_qlpbupt as u128)
-        .ok_or(PerpRouterError::MathOverflow)?;
-    let q = n / (base_lots_per_base_unit as u128);
-    if q > u64::MAX as u128 {
-        return Err(PerpRouterError::MathOverflow.into());
-    }
-    Ok(q as u64)
-}
-
-/// Quote lots → required margin (in atoms). For v1 we assume
-/// quote_lot_size = 1 (i.e. 1 quote lot = 1 collateral atom). Markets
-/// with a different quote-lot scaling will need a per-market
-/// `quote_lot_size` field on PerpMarket — currently a follow-up.
-fn quote_lots_to_margin(quote_lots: u64, max_leverage_bps: u32) -> Result<u64, ProgramError> {
-    assert_with_msg(
-        max_leverage_bps > 0,
-        ProgramError::InvalidAccountData,
-        "PerpMarket.max_leverage_bps must be > 0",
-    )?;
-    quote_lots
-        .checked_mul(10_000)
-        .ok_or_else(|| PerpRouterError::MathOverflow.into())
-        .map(|n| n / max_leverage_bps as u64)
 }
 
 /// Find a position slot for `market`; allocate a new slot if absent.
@@ -638,6 +594,20 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
             .locked_margin
             .checked_add(posted_margin)
             .ok_or(PerpRouterError::MathOverflow)?;
+    }
+
+    // Emit the resting FIFOOrderId via Solana return data so clients can
+    // cancel it later with CancelOrderPerp. 16 bytes total:
+    //   [0..8]   price_in_ticks      (u64 LE)
+    //   [8..16]  order_sequence_number (u64 LE)
+    // The side is recoverable from the high bit of order_sequence_number
+    // (Phoenix's `Side::from_order_sequence_number`). Empty payload when
+    // the order didn't rest (fully filled or rejected).
+    if let Some(oid) = resting_order_id {
+        let mut buf = [0u8; 16];
+        buf[..8].copy_from_slice(&u64::from(oid.price_in_ticks).to_le_bytes());
+        buf[8..].copy_from_slice(&oid.order_sequence_number.to_le_bytes());
+        set_return_data(&buf);
     }
 
     msg!(

@@ -14,6 +14,7 @@
 
 pub mod envelope;
 pub mod haircut;
+pub mod margin;
 pub mod recovery;
 pub mod side_index;
 pub mod warmup;
