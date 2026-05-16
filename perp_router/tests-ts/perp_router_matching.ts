@@ -242,6 +242,8 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     const aColBefore = await tc.getTraderCollateral(traderA.publicKey);
     const bColBefore = await tc.getTraderCollateral(wallet.publicKey);
     const bReserveBefore = await tc.getTraderPnlReserveTotal(wallet.publicKey);
+    const aLenBefore = await tc.getTraderPositionsLen(traderA.publicKey);
+    const bLenBefore = await tc.getTraderPositionsLen(wallet.publicKey);
 
     const sig = await tc.placeOrderPerp(
       traderA,
@@ -277,9 +279,11 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     assert(aColAfter.eq(aColBefore), "A collateral net Δ should be 0");
     assert(aLockedAfter.eqn(0), "A locked_margin should be 0");
     assert(aReserveAfter.eqn(0), "A should have no reserve entry (loss)");
-    assert(aPos !== null && aPos.size_stored.eqn(0), "A position should be closed");
-    assert(aPos!.entry_price.eqn(0), "A entry_price should be zeroed on close");
-    assert(aPos!.margin_locked.eqn(0), "A position margin should be 0");
+    // Slot compaction: after a full close the position slot is dropped
+    // (swap-with-last + len--), not just zeroed in place. So we expect
+    // getTraderPositionForMarket to return null and positions_len == 0
+    // for the only-market case.
+    assert(aPos === null, "A position slot should be compacted (null) after full close");
 
     // B: long closed at higher price → profit 50 to reserve. position margin
     //    50 released back to collateral. B's resting-ask locked_margin (55)
@@ -287,9 +291,21 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     assert(bColAfter.sub(bColBefore).eqn(50), "B collateral should increase by 50 (released margin)");
     assert(bLockedAfter.eqn(0), "B locked_margin should be 0");
     assert(bReserveAfter.sub(bReserveBefore).eqn(50), "B pnl_reserve should grow by 50 (profit)");
-    assert(bPos !== null && bPos.size_stored.eqn(0), "B position should be closed");
-    assert(bPos!.entry_price.eqn(0), "B entry_price should be zeroed on close");
-    assert(bPos!.margin_locked.eqn(0), "B position margin should be 0");
+    assert(bPos === null, "B position slot should be compacted (null) after full close");
+
+    // Compaction check: each side had one slot for this market entering
+    // step 9; after the full close that slot is swapped-with-last and
+    // positions_len decremented. We assert -1 deltas rather than absolute
+    // 0 because wallet's TraderAccount carries zombie slots from earlier
+    // runs (predating the compaction fix).
+    const aLenAfter = await tc.getTraderPositionsLen(traderA.publicKey);
+    const bLenAfter = await tc.getTraderPositionsLen(wallet.publicKey);
+    console.log(
+      "    A.positions_len:", aLenBefore, "→", aLenAfter,
+      "   B.positions_len:", bLenBefore, "→", bLenAfter,
+    );
+    assert.equal(aLenBefore - aLenAfter, 1, "A.positions_len should decrement by 1");
+    assert.equal(bLenBefore - bLenAfter, 1, "B.positions_len should decrement by 1");
   });
 
   it("10. (ER) A posts small resting BID — locks margin to test withdraw gate", async () => {

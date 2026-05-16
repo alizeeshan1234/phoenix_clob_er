@@ -1166,6 +1166,15 @@ export class PerpTestClient {
     return total;
   }
 
+  /** Number of currently-allocated entries in `TraderAccount.positions`
+   *  (offset 960). 0 means the slot table is empty / fully compacted. */
+  async getTraderPositionsLen(owner: PublicKey): Promise<number> {
+    const [pda] = this.traderAccountPda(owner);
+    const a = await this.getLiveAccount(pda);
+    if (!a) return 0;
+    return a.data[960];
+  }
+
   /**
    * Walk positions[] for the trader's slot matching `market`. Returns
    * null if no slot has been allocated for that market. Use this in

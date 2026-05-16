@@ -148,11 +148,12 @@ fn apply_fill_to_position(
     }
 
     let slot = position_slot(t, market)?;
-    let pos = &mut t.positions[slot];
-    let old = pos.size_stored;
-    let same_sign = old == 0 || ((old > 0) == (signed_size > 0));
+    let became_zero = {
+        let pos = &mut t.positions[slot];
+        let old = pos.size_stored;
+        let same_sign = old == 0 || ((old > 0) == (signed_size > 0));
 
-    if same_sign {
+        if same_sign {
         // ── OPEN or SCALE-UP ──────────────────────────────────────────
         // Taker pays from collateral; maker's reservation already
         // released — its `fill_margin` worth conceptually transfers to
@@ -192,6 +193,7 @@ fn apply_fill_to_position(
             .margin_locked
             .checked_add(fill_margin)
             .ok_or(PerpRouterError::MathOverflow)?;
+        false
     } else {
         // ── CLOSE (or CLOSE + FLIP) ───────────────────────────────────
         let old_abs = old.unsigned_abs();
@@ -242,8 +244,8 @@ fn apply_fill_to_position(
         pos.size_stored = new_size;
 
         if new_size == 0 {
-            // Pure full close: zero metadata. (Slot stays allocated
-            // for the same market; reused on next open.)
+            // Pure full close: zero metadata so the post-scope compaction
+            // step can drop this slot via swap-with-last.
             pos.entry_price = 0;
             pos.margin_locked = 0;
         } else if fill_abs > old_abs {
@@ -264,6 +266,23 @@ fn apply_fill_to_position(
         }
         // Else: partial close — entry_price preserved for the remaining
         // same-sign exposure.
+        new_size == 0
+        }
+    };
+
+    // Slot compaction. Mirrors DirectClosePosition's swap-with-last so
+    // a trader churning across markets doesn't stall at the MAX_POSITIONS
+    // cap with zombie zero-size slots. Only the close branch can produce
+    // `became_zero` — open/scale-up always sets size_stored ≠ 0, and the
+    // flip path keeps the slot occupied with the opposite-direction
+    // remainder.
+    if became_zero {
+        let last = (t.positions_len as usize).saturating_sub(1);
+        if slot != last {
+            t.positions[slot] = t.positions[last];
+        }
+        t.positions[last] = Position::default();
+        t.positions_len = t.positions_len.saturating_sub(1);
     }
 
     Ok(())
