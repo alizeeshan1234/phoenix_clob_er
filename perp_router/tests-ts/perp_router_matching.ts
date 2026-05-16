@@ -88,10 +88,15 @@ describe("perp-router-matching (devnet, cross-trade fills)", () => {
     if (!(await tc.baseConnection.getAccountInfo(walletAccountPda))) {
       await tc.initializeTrader(wallet);
     }
+    // Non-trivial lot params so the matched-flow margin math exercises
+    // the full `quote_lots = base × price × tick / base_lots_per_base_unit`
+    // conversion, not the tick=1, base_lots=1 fast-path. We pick a 1:1
+    // ratio (tick = base_lots = 2) so existing assertion values stay
+    // numerically the same.
     const { orderbook, sig } = await tc.initializeOrderbook(
       perpMarketPda,
-      new BN(1),
-      new BN(1),
+      new BN(2), // tick_size_in_quote_lots_per_base_unit
+      new BN(2), // base_lots_per_base_unit
       0,
     );
     console.log("    init orderbook:", sig);

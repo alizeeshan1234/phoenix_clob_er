@@ -41,10 +41,16 @@
 
 use borsh::{BorshDeserialize, BorshSerialize};
 use ephemeral_rollups_sdk::consts::DELEGATION_PROGRAM_ID;
-use phoenix::state::{
-    markets::{market_events::MarketEvent, market_traits::WritableMarket},
-    order_packet::OrderPacket,
-    SelfTradeBehavior, Side,
+use phoenix::{
+    quantities::WrapperU64,
+    state::{
+        markets::{
+            market_events::MarketEvent,
+            market_traits::{Market, WritableMarket},
+        },
+        order_packet::OrderPacket,
+        SelfTradeBehavior, Side,
+    },
 };
 use sokoban::ZeroCopy;
 use solana_program::{
@@ -95,15 +101,47 @@ enum MarginSource {
     LockedMargin,
 }
 
-/// `quote_notional × 10_000 / max_leverage_bps`. Assumes tick / lot
-/// params of 1:1 (see file header).
-fn notional_to_margin(quote_notional: u64, max_leverage_bps: u32) -> Result<u64, ProgramError> {
+/// Convert (base_lots, price_in_ticks) to quote_lots using the matching
+/// engine's accounting formula:
+///   quote_lots = base_lots × price_in_ticks × tick_size_in_quote_lots_per_base_unit
+///                / base_lots_per_base_unit
+/// All arithmetic in u128 so high price × size doesn't overflow before
+/// the divide. The earlier fast-path (`base_lots × price`) only worked
+/// when tick_size = base_lots_per_base_unit = 1.
+fn quote_lots_from_base_at_price(
+    base_lots: u64,
+    price_in_ticks: u64,
+    tick_size_qlpbupt: u64,
+    base_lots_per_base_unit: u64,
+) -> Result<u64, ProgramError> {
+    assert_with_msg(
+        base_lots_per_base_unit > 0,
+        ProgramError::InvalidAccountData,
+        "base_lots_per_base_unit must be > 0",
+    )?;
+    let n: u128 = (base_lots as u128)
+        .checked_mul(price_in_ticks as u128)
+        .ok_or(PerpRouterError::MathOverflow)?
+        .checked_mul(tick_size_qlpbupt as u128)
+        .ok_or(PerpRouterError::MathOverflow)?;
+    let q = n / (base_lots_per_base_unit as u128);
+    if q > u64::MAX as u128 {
+        return Err(PerpRouterError::MathOverflow.into());
+    }
+    Ok(q as u64)
+}
+
+/// Quote lots → required margin (in atoms). For v1 we assume
+/// quote_lot_size = 1 (i.e. 1 quote lot = 1 collateral atom). Markets
+/// with a different quote-lot scaling will need a per-market
+/// `quote_lot_size` field on PerpMarket — currently a follow-up.
+fn quote_lots_to_margin(quote_lots: u64, max_leverage_bps: u32) -> Result<u64, ProgramError> {
     assert_with_msg(
         max_leverage_bps > 0,
         ProgramError::InvalidAccountData,
         "PerpMarket.max_leverage_bps must be > 0",
     )?;
-    quote_notional
+    quote_lots
         .checked_mul(10_000)
         .ok_or_else(|| PerpRouterError::MathOverflow.into())
         .map(|n| n / max_leverage_bps as u64)
@@ -355,14 +393,28 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         m.max_leverage_bps
     };
 
+    // Lot params live on the FIFOMarket. Pull them once so margin math
+    // doesn't have to keep re-borrowing the 9 KB orderbook account.
+    let (tick_size_qlpbupt, base_lots_per_base_unit) = {
+        let buf = orderbook_info.try_borrow_data()?;
+        let market =
+            PerpOrderbook::load_bytes(&buf).ok_or(ProgramError::InvalidAccountData)?;
+        (
+            u64::from(market.get_tick_size()),
+            u64::from(market.get_base_lots_per_base_unit()),
+        )
+    };
+
     // Worst-case margin pre-check (full size posts uncrossed). Closing
     // fills release margin rather than consume it, so this strictly
     // over-estimates — safe.
-    let worst_quote_notional = p
-        .price_in_ticks
-        .checked_mul(p.num_base_lots)
-        .ok_or(PerpRouterError::MathOverflow)?;
-    let worst_margin = notional_to_margin(worst_quote_notional, max_leverage_bps)?;
+    let worst_quote_lots = quote_lots_from_base_at_price(
+        p.num_base_lots,
+        p.price_in_ticks,
+        tick_size_qlpbupt,
+        base_lots_per_base_unit,
+    )?;
+    let worst_margin = quote_lots_to_margin(worst_quote_lots, max_leverage_bps)?;
     {
         let buf = trader_account_info.try_borrow_data()?;
         let t = bytemuck::from_bytes::<TraderAccount>(&buf[..size_of::<TraderAccount>()]);
@@ -437,11 +489,13 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let market_key = *perp_market_info.key;
     for i in 0..fill_count {
         let fill = fills[i];
-        let fill_notional = fill
-            .price_in_ticks
-            .checked_mul(fill.base_lots_filled)
-            .ok_or(PerpRouterError::MathOverflow)?;
-        let fill_margin = notional_to_margin(fill_notional, max_leverage_bps)?;
+        let fill_quote_lots = quote_lots_from_base_at_price(
+            fill.base_lots_filled,
+            fill.price_in_ticks,
+            tick_size_qlpbupt,
+            base_lots_per_base_unit,
+        )?;
+        let fill_margin = quote_lots_to_margin(fill_quote_lots, max_leverage_bps)?;
 
         let taker_signed: i64 = match side {
             Side::Bid => fill.base_lots_filled as i64,
@@ -489,15 +543,19 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
 
     // ── Posted (uncrossed) portion: reserve margin into locked_margin
     //    (Stage 3a). Closing fills don't post; only fresh outstanding
-    //    quote sits on the book.
-    let posted_quote_notional: u64 = match side {
+    //    quote sits on the book. Bid side: engine reports
+    //    `num_quote_lots_posted` directly. Ask side: engine reports base
+    //    lots, so we convert via the lot-aware formula.
+    let posted_quote_lots: u64 = match side {
         Side::Bid => u64::from(response.num_quote_lots_posted),
-        Side::Ask => p
-            .price_in_ticks
-            .checked_mul(u64::from(response.num_base_lots_posted))
-            .ok_or(PerpRouterError::MathOverflow)?,
+        Side::Ask => quote_lots_from_base_at_price(
+            u64::from(response.num_base_lots_posted),
+            p.price_in_ticks,
+            tick_size_qlpbupt,
+            base_lots_per_base_unit,
+        )?,
     };
-    let posted_margin = notional_to_margin(posted_quote_notional, max_leverage_bps)?;
+    let posted_margin = quote_lots_to_margin(posted_quote_lots, max_leverage_bps)?;
     if posted_margin > 0 {
         let mut buf = trader_account_info.try_borrow_mut_data()?;
         let t = bytemuck::from_bytes_mut::<TraderAccount>(&mut buf[..size_of::<TraderAccount>()]);
