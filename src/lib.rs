@@ -10,7 +10,6 @@
 //! orders on the book. Users who swap against the book will have their funds settle
 //! instantaneously, while the funds of users who place orders on the book will be
 //! immediately available for withdraw post fill.
-//!
 
 #[macro_use]
 mod log;
