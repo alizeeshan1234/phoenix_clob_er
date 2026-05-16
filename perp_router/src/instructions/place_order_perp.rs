@@ -34,9 +34,12 @@
 //! Account list:
 //!   [0] trader         (signer)
 //!   [1] trader_account (writable, delegated)
-//!   [2] perp_market    (readonly; for max_leverage_bps + orderbook PDA)
+//!   [2] perp_market    (readonly; for max_leverage_bps + funding_index)
 //!   [3] orderbook      (writable, delegated)
-//!   [4..] maker_accounts (writable, delegated) — one TraderAccount per
+//!   [4] global_state   (readonly; for A coefficient — read-only here
+//!                       so it can stay un-delegated on base, mirroring
+//!                       DirectOpen/Close's treatment)
+//!   [5..] maker_accounts (writable, delegated) — one TraderAccount per
 //!         maker the caller expects to fill against.
 
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -67,9 +70,14 @@ use std::mem::size_of;
 use crate::{
     constants::{MAX_POSITIONS, WARMUP_SLOTS},
     error::{assert_with_msg, PerpRouterError},
-    risk::warmup::push_reserve,
-    state::{trader_account::Position, PerpMarket, PerpOrderbook, TraderAccount},
-    validation::loaders::{find_orderbook_address, find_trader_account_address},
+    risk::{
+        side_index::{effective_size, position_funding_owed},
+        warmup::push_reserve,
+    },
+    state::{trader_account::Position, GlobalState, PerpMarket, PerpOrderbook, TraderAccount},
+    validation::loaders::{
+        find_global_state_address, find_orderbook_address, find_trader_account_address,
+    },
 };
 
 /// Max fills the engine may emit per call. Bounded by Solana's per-tx
@@ -168,6 +176,7 @@ fn position_slot(t: &mut TraderAccount, market: &Pubkey) -> Result<usize, Progra
 /// `collateral` / `locked_margin` / `position.margin_locked` as the case
 /// requires and realizing PnL on any closed portion. See file header
 /// for the case dispatch.
+#[allow(clippy::too_many_arguments)]
 fn apply_fill_to_position(
     t: &mut TraderAccount,
     market: &Pubkey,
@@ -176,6 +185,8 @@ fn apply_fill_to_position(
     fill_margin: u64,
     source: MarginSource,
     current_slot: u64,
+    a_coefficient: i128,
+    current_funding_index: i128,
 ) -> ProgramResult {
     // Maker side: always release the resting order's reservation first.
     if source == MarginSource::LockedMargin {
@@ -205,6 +216,30 @@ fn apply_fill_to_position(
 
         let old_abs = old.unsigned_abs() as u128;
         let added_abs = signed_size.unsigned_abs() as u128;
+
+        // Scale-up: settle accrued funding on the existing (effective)
+        // size before re-anchoring. Without this the new index would
+        // make the engine retroactively charge funding on the added
+        // size from before it existed. Fresh-open (old_abs == 0) has
+        // nothing to settle — just set the anchor below.
+        if old_abs > 0 {
+            let entry_f = i128::from_le_bytes(pos.entry_funding_index);
+            let eff_old = effective_size(old, a_coefficient)?;
+            let funding =
+                position_funding_owed(eff_old, current_funding_index, entry_f)?;
+            if funding > 0 {
+                let loss = funding.unsigned_abs() as u64;
+                t.collateral = t.collateral.saturating_sub(loss);
+            } else if funding < 0 {
+                push_reserve(
+                    &mut t.pnl_reserve,
+                    &mut t.pnl_reserve_len,
+                    funding.unsigned_abs() as u64,
+                    current_slot.saturating_add(WARMUP_SLOTS),
+                )?;
+            }
+        }
+
         pos.entry_price = if old_abs == 0 {
             fill_price
         } else {
@@ -231,6 +266,10 @@ fn apply_fill_to_position(
             .margin_locked
             .checked_add(fill_margin)
             .ok_or(PerpRouterError::MathOverflow)?;
+        // Re-anchor the funding index for the combined position. Pre-existing
+        // funding was settled above; from here, funding accrues against the
+        // new (combined) size from `current_funding_index` onward.
+        pos.entry_funding_index = current_funding_index.to_le_bytes();
         false
     } else {
         // ── CLOSE (or CLOSE + FLIP) ───────────────────────────────────
@@ -238,16 +277,31 @@ fn apply_fill_to_position(
         let fill_abs = signed_size.unsigned_abs();
         let closed = old_abs.min(fill_abs);
 
-        // PnL on closed portion. Long closed by selling at higher
-        // price → profit. Short closed by buying at lower → profit.
-        let pnl_per_unit: i128 = if old > 0 {
-            (fill_price as i128) - (pos.entry_price as i128)
+        // Apply Percolator's lazy A-coefficient + accrued funding on the
+        // closed portion, mirroring `direct_close_position`:
+        //
+        //   eff_closed = effective_size(closed_signed_stored, A)
+        //   gross      = eff_closed × (fill_price − entry_price)
+        //   funding    = position_funding_owed(eff_closed, F_now, F_entry)
+        //   pnl_net    = gross − funding
+        //
+        // `eff_closed` is signed (negative for shorts) so `gross` comes
+        // out with the right sign automatically.
+        let closed_signed_stored: i64 = if old > 0 {
+            closed as i64
         } else {
-            (pos.entry_price as i128) - (fill_price as i128)
+            -(closed as i64)
         };
-        let pnl_raw: i128 = pnl_per_unit
-            .checked_mul(closed as i128)
+        let eff_closed = effective_size(closed_signed_stored, a_coefficient)?;
+        let price_diff = (fill_price as i128)
+            .checked_sub(pos.entry_price as i128)
             .ok_or(PerpRouterError::MathOverflow)?;
+        let gross: i128 = (eff_closed as i128)
+            .checked_mul(price_diff)
+            .ok_or(PerpRouterError::MathOverflow)?;
+        let entry_f = i128::from_le_bytes(pos.entry_funding_index);
+        let funding = position_funding_owed(eff_closed, current_funding_index, entry_f)?;
+        let pnl_net: i128 = gross.checked_sub(funding).ok_or(PerpRouterError::MathOverflow)?;
 
         // Proportional release of existing position margin → collateral.
         let released = ((pos.margin_locked as u128)
@@ -260,18 +314,17 @@ fn apply_fill_to_position(
             .checked_add(released)
             .ok_or(PerpRouterError::MathOverflow)?;
 
-        // PnL: profit → reserve with warmup. Loss → debit collateral
-        // (capped at zero — bankruptcy is silent for v1; v2 should
-        // mark the trader liquidatable).
-        if pnl_raw > 0 {
+        // pnl_net > 0 → reserve with warmup. pnl_net < 0 → debit
+        // collateral (saturating at zero; bankruptcy is silent in v1).
+        if pnl_net > 0 {
             push_reserve(
                 &mut t.pnl_reserve,
                 &mut t.pnl_reserve_len,
-                pnl_raw as u64,
+                pnl_net as u64,
                 current_slot.saturating_add(WARMUP_SLOTS),
             )?;
-        } else if pnl_raw < 0 {
-            let loss = pnl_raw.unsigned_abs() as u64;
+        } else if pnl_net < 0 {
+            let loss = pnl_net.unsigned_abs() as u64;
             t.collateral = t.collateral.saturating_sub(loss);
         }
 
@@ -301,9 +354,12 @@ fn apply_fill_to_position(
             }
             pos.entry_price = fill_price;
             pos.margin_locked = leftover_margin;
+            // Flipped position is freshly opened; anchor funding here.
+            pos.entry_funding_index = current_funding_index.to_le_bytes();
         }
-        // Else: partial close — entry_price preserved for the remaining
-        // same-sign exposure.
+        // Else: partial close — entry_price + entry_funding_index
+        // preserved for the remaining same-sign exposure (still anchored
+        // at its original entry).
         new_size == 0
         }
     };
@@ -358,6 +414,7 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
     let trader_account_info = next_account_info(it)?;
     let perp_market_info = next_account_info(it)?;
     let orderbook_info = next_account_info(it)?;
+    let global_state_info = next_account_info(it)?;
     let remaining_accounts: &[AccountInfo] = it.as_slice();
 
     assert_with_msg(
@@ -387,10 +444,24 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
         "trader_account PDA mismatch",
     )?;
 
-    let max_leverage_bps = {
+    let (max_leverage_bps, current_funding_index) = {
         let buf = perp_market_info.try_borrow_data()?;
         let m = bytemuck::from_bytes::<PerpMarket>(&buf[..size_of::<PerpMarket>()]);
-        m.max_leverage_bps
+        (m.max_leverage_bps, m.get_funding_index())
+    };
+
+    // A coefficient from GlobalState. Read-only here, so it can stay
+    // un-delegated on base (ER serves a replicated clone).
+    let a_coefficient = {
+        let buf = global_state_info.try_borrow_data()?;
+        let g = bytemuck::from_bytes::<GlobalState>(&buf[..size_of::<GlobalState>()]);
+        let (expected, _) = find_global_state_address(program_id);
+        assert_with_msg(
+            &expected == global_state_info.key,
+            PerpRouterError::InvalidPda,
+            "GlobalState PDA mismatch",
+        )?;
+        g.get_a()
     };
 
     // Lot params live on the FIFOMarket. Pull them once so margin math
@@ -515,6 +586,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 fill_margin,
                 MarginSource::FreeCollateral,
                 current_slot,
+                a_coefficient,
+                current_funding_index,
             )?;
         }
 
@@ -537,6 +610,8 @@ pub fn process(program_id: &Pubkey, accounts: &[AccountInfo], data: &[u8]) -> Pr
                 fill_margin,
                 MarginSource::LockedMargin,
                 current_slot,
+                a_coefficient,
+                current_funding_index,
             )?;
         }
     }

@@ -449,6 +449,7 @@ export class PerpTestClient {
   ): Promise<string> {
     const [orderbook] = this.orderbookPda(perpMarket);
     const [traderAccount] = this.traderAccountPda(trader.publicKey);
+    const [globalState] = this.globalStatePda();
     const data = Buffer.concat([
       u8(TAG.PlaceOrderPerp),
       u8(side),
@@ -461,6 +462,10 @@ export class PerpTestClient {
       { pubkey: traderAccount, isSigner: false, isWritable: true },
       { pubkey: perpMarket, isSigner: false, isWritable: false },
       { pubkey: orderbook, isSigner: false, isWritable: true },
+      // GlobalState is read-only on this path (A coefficient only). Mark
+      // not-writable so ER doesn't reject the tx for writing to an
+      // un-delegated account.
+      { pubkey: globalState, isSigner: false, isWritable: false },
     ];
     for (const m of makerTraderAccounts) {
       keys.push({ pubkey: m, isSigner: false, isWritable: true });
